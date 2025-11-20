@@ -1,5 +1,5 @@
 streamlit
-easyocr
-torch
 opencv-python-headless
 Pillow
+pytesseract
+opencv-python-headless
