@@ -1,0 +1,5 @@
+streamlit
+easyocr
+torch
+opencv-python-headless
+Pillow
