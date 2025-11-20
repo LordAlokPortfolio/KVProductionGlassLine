@@ -7,6 +7,7 @@ from email.message import EmailMessage
 import smtplib
 from PIL import Image
 import io
+import smtplib
 
 # ==========================================
 # CONFIG (STREAMLIT SECRETS)
@@ -73,14 +74,22 @@ def extract_with_openai(image_bytes):
 # ==========================================
 # EMAIL SENDER
 # ==========================================
+from email.message import EmailMessage
+
 def send_email(subject, body, image_bytes):
     msg = EmailMessage()
     msg["From"] = f"{FROM_NAME} <{EMAIL_USER}>"
-    msg["To"] = TO_EMAILS
-    msg["Cc"] = CC_EMAILS
+
+    # Convert comma-separated secrets into clean lists
+    to_list = [e.strip() for e in st.secrets["TO_EMAILS"].split(",") if e.strip()]
+    cc_list = [e.strip() for e in st.secrets["CC_EMAILS"].split(",") if e.strip()]
+
+    msg["To"] = ", ".join(to_list)
+    msg["Cc"] = ", ".join(cc_list)
     msg["Subject"] = subject
     msg.set_content(body)
 
+    # Attach label image
     msg.add_attachment(
         image_bytes,
         maintype="image",
@@ -88,10 +97,12 @@ def send_email(subject, body, image_bytes):
         filename="glass_label.jpg"
     )
 
+    # Combine "To" + "Cc" for sending
+    all_recipients = to_list + cc_list
+
     with smtplib.SMTP_SSL("smtp.mail.me.com", 465) as smtp:
         smtp.login(EMAIL_USER, EMAIL_PASS)
-        smtp.send_message(msg)
-
+        smtp.send_message(msg, to_addrs=all_recipients)
 # ==========================================
 # UI SETTINGS (iPhone optimized)
 # ==========================================
