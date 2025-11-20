@@ -1,13 +1,6 @@
 streamlit
-<<<<<<< HEAD
 opencv-python-headless
 Pillow
 numpy
 requests
 openai
-=======
-pytesseract
-opencv-python-headless
-Pillow
-numpy
->>>>>>> 40d5ed663e491bf564366dd0f822e424c1ee424e
