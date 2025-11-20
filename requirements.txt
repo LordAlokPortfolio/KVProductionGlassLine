@@ -1,5 +1,6 @@
 streamlit
-easyocr
-torch
 opencv-python-headless
 Pillow
+numpy
+requests
+openai
