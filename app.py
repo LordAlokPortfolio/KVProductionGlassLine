@@ -23,6 +23,9 @@ TO_EMAILS = st.secrets["TO_EMAILS"]
 CC_EMAILS = st.secrets["CC_EMAILS"]
 ADMIN_PIN = st.secrets["ADMIN_PIN"]
 
+# DEBUG LINE
+st.write ("api KEY LOADED:", "OPENAI_API-KEY" in st.secrets)
+
 # Convert comma-separated list → python list
 TO_LIST = [x.strip() for x in TO_EMAILS.split(",") if x.strip()]
 CC_LIST = [x.strip() for x in CC_EMAILS.split(",") if x.strip()]
