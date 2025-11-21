@@ -1,6 +1,4 @@
 streamlit
-opencv-python-headless
-Pillow
-numpy
-requests
-openai>=1.43.0
+Pillow==10.3.0
+openai==1.37.0
+python-dotenv==1.0.1
