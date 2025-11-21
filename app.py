@@ -14,10 +14,10 @@ from openai import OpenAI
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 EMAIL_USER = st.secrets["EMAIL_USER"]
 EMAIL_PASS = st.secrets["EMAIL_PASS"]
-
+FROM_NAME = st.secrets["FROM_NAME"]
 TO_EMAILS = st.secrets["TO_EMAILS"]        # only YOU
 CC_EMAILS = st.secrets["CC_EMAILS"]        # you + ning
-
+ADMIN_PIN = st.secrets["ADMIN_PIN"]
 # ==========================================================
 # OPENAI CLIENT
 # ==========================================================
@@ -78,26 +78,40 @@ Do NOT add commentary.
         return ("OCR ERROR", "OCR ERROR", "OCR ERROR", "OCR ERROR")
 
 
-# ==========================================================
-# EMAIL FUNCTION
-# ==========================================================
+# ========================
+# EMAIL FORMAT SANITIZER
+# ========================
+def sanitize_emails(raw_value):
+    if isinstance(raw_value, list):
+        return [e.strip() for e in raw_value]
+
+    # If comma-separated string
+    return [e.strip() for e in raw_value.split(",") if e.strip()]
+
+
 def send_email(subject, body, attachments):
     msg = EmailMessage()
-    msg["From"] = EMAIL_USER
-    msg["To"] = TO_EMAILS
-    msg["Cc"] = CC_EMAILS
+    msg["From"] = f"{FROM_NAME} <{EMAIL_USER}>"
+
+    to_list = sanitize_emails(st.secrets["TO_EMAILS"])
+    cc_list = sanitize_emails(st.secrets["CC_EMAILS"])
+
+    msg["To"] = ", ".join(to_list)
+    msg["Cc"] = ", ".join(cc_list)
+
     msg["Subject"] = subject
     msg.set_content(body)
 
-    for idx, img_bytes in enumerate(attachments, start=1):
+    # Attachments (if multiple)
+    for filename, data in attachments:
         msg.add_attachment(
-            img_bytes,
+            data,
             maintype="image",
             subtype="jpeg",
-            filename=f"label_{idx}.jpg"
+            filename=filename
         )
 
-    with smtplib.SMTP_SSL("smtp.mail.me.com", 465) as smtp:
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(EMAIL_USER, EMAIL_PASS)
         smtp.send_message(msg)
 
