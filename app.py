@@ -10,7 +10,7 @@ import re
 import csv
 
 # =====================================================================
-# SECRETS
+# LOAD SECRETS
 # =====================================================================
 EMAIL_USER = st.secrets["EMAIL_USER"]
 EMAIL_PASS = st.secrets["EMAIL_PASS"]
@@ -22,7 +22,7 @@ OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =====================================================================
-# VALID SUFFIXES — STRICT (NO PARAPHRASING PREFIX)
+# VALID SUFFIXES (USED ONLY FOR FIXING OCR SUFFIX TYPOS)
 # =====================================================================
 VALID_SUFFIXES = [
     "T", "E180ESC", "Q180", "E272", "Q272",
@@ -30,10 +30,14 @@ VALID_SUFFIXES = [
     "NREEDV", "MATT", "GRY", "P621", "BRZ"
 ]
 
-PREFIX_SET = ["3.1", "3.9", "4.7", "5.7"]
+# =====================================================================
+# INITIALIZE BATCH STORAGE
+# =====================================================================
+if "batch" not in st.session_state:
+    st.session_state.batch = []   # Each item: {img, qty, reason, notes}
 
 # =====================================================================
-# IMAGE PREPROCESSING
+# IMAGE PREPROCESSING (improves OCR accuracy)
 # =====================================================================
 def preprocess(img_bytes):
     img = Image.open(io.BytesIO(img_bytes))
@@ -45,7 +49,7 @@ def preprocess(img_bytes):
     return buf.getvalue()
 
 # =====================================================================
-# OCR RAW TEXT
+# OCR RAW TEXT WITH GPT-4O-MINI
 # =====================================================================
 def ocr_raw(img_bytes):
     b64 = base64.b64encode(img_bytes).decode()
@@ -67,19 +71,22 @@ def ocr_raw(img_bytes):
         return f"OCR_ERROR: {e}"
 
 # =====================================================================
-# PREFIX REPAIR (Option B: fix ANY broken form)
+# PREFIX REPAIR (fixes 39 → 3.9, 3 9 → 3.9, 3-9 → 3.9, etc.)
 # =====================================================================
 def repair_prefix(text):
     patterns = {
         r"\b3\s*9\b": "3.9",
         r"\b39\b": "3.9",
         r"\b3[-/:,_ ]+9\b": "3.9",
+
         r"\b3\s*1\b": "3.1",
         r"\b31\b": "3.1",
         r"\b3[-/:,_ ]+1\b": "3.1",
+
         r"\b4\s*7\b": "4.7",
         r"\b47\b": "4.7",
         r"\b4[-/:,_ ]+7\b": "4.7",
+
         r"\b5\s*7\b": "5.7",
         r"\b57\b": "5.7",
         r"\b5[-/:,_ ]+7\b": "5.7",
@@ -89,56 +96,52 @@ def repair_prefix(text):
     return text
 
 # =====================================================================
-# TYPE EXTRACTION (NO PARAPHRASING)
+# SUFFIX SIMILARITY
+# =====================================================================
+def similarity(a, b):
+    a, b = a.upper(), b.upper()
+    return sum(1 for x, y in zip(a, b) if x == y)
+
+# =====================================================================
+# TYPE EXTRACTION (EXACT ORDER PRESERVED)
 # =====================================================================
 def extract_type(raw):
-    raw = repair_prefix(raw.replace("\n", " "))
+    raw = raw.replace("\n", " ")
+    raw = repair_prefix(raw)
+    raw = re.sub(r"\s+", " ", raw)
 
-    # Find the line containing prefix
+    raw = re.sub(r"C\s*L\s*T", "CLT", raw)  # Normalize CLT spacing
+
     prefix_pat = r"(3\.1|3\.9|4\.7|5\.7)[^\n]+"
     m = re.search(prefix_pat, raw)
     if not m:
         return ""
 
-    line = m.group(0)
-    line = re.sub(r"\s+", " ", line).strip()
-
-    # Clean CLT spacing
-    line = re.sub(r"C\s*L\s*T", "CLT", line)
+    line = m.group(0).strip()
 
     parts = line.split()
     if len(parts) == 1:
-        return parts[0].strip()
+        return parts[0]
 
-    # Fix suffix only — keep original ordering
     corrected = []
-    for part in parts:
-        part_clean = part.upper()
+    for p in parts:
+        raw_p = p.upper()
 
-        # Fix suffix if needed
-        best = part_clean
+        best = raw_p
         best_score = -1
+
         for suf in VALID_SUFFIXES:
-            s = similarity(part_clean, suf)
+            s = similarity(raw_p, suf)
             if s > best_score:
                 best_score = s
                 best = suf
 
-        # If match is weak → keep OCR version
-        if best_score < 2:
-            corrected.append(part)
-        else:
+        if best_score >= 2:
             corrected.append(best)
+        else:
+            corrected.append(p)
 
     return " ".join(corrected).strip()
-
-# =====================================================================
-# Simple similarity score
-# =====================================================================
-def similarity(a, b):
-    a, b = a.upper(), b.upper()
-    score = sum(1 for x, y in zip(a, b) if x == y)
-    return score
 
 # =====================================================================
 # SIZE EXTRACTION
@@ -166,76 +169,112 @@ def extract_po(raw):
     return matches[0] if matches else ""
 
 # =====================================================================
-# SEND EMAIL WITH TABLE + CSV
+# EMAIL SENDER
 # =====================================================================
-def send_email(row_str, csv_bytes, img_bytes):
+def send_email(table_string, csv_bytes, image_list):
     msg = EmailMessage()
     msg["From"] = f"{FROM_NAME} <{EMAIL_USER}>"
     msg["To"] = TO_EMAILS
     if CC_EMAILS:
         msg["Cc"] = CC_EMAILS
     msg["Subject"] = f"Glass Damage Report – {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    msg.set_content(row_str)
+    msg.set_content(table_string)
 
     msg.add_attachment(csv_bytes, maintype="text", subtype="csv", filename="glass_report.csv")
 
-    msg.add_attachment(img_bytes, maintype="image", subtype="jpeg", filename="label.jpg")
+    for i, img_bytes in enumerate(image_list):
+        msg.add_attachment(img_bytes, maintype="image", subtype="jpeg", filename=f"label_{i+1}.jpg")
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(EMAIL_USER, EMAIL_PASS)
         smtp.send_message(msg)
 
 # =====================================================================
-# UI — ONE PAGE
+# UI — SINGLE PAGE MULTI-PHOTO BATCH
 # =====================================================================
-st.title("KV Glass Damage Reporter")
+st.title("KV Glass Damage Reporter (Multi-Photo)")
 
 mode = st.radio("Choose Method:", ["Take Photo", "Upload Photo"])
-img_bytes = None
 
 if mode == "Take Photo":
-    cam = st.camera_input("Capture Label")
+    cam = st.camera_input("Capture Photo")
     if cam:
-        img_bytes = cam.getvalue()
+        st.session_state.batch.append({
+            "img": cam.getvalue(),
+            "qty": "",
+            "reason": ""
+        })
 
 if mode == "Upload Photo":
-    f = st.file_uploader("Upload Label Image", type=["jpg","jpeg","png"])
-    if f:
-        img_bytes = f.read()
+    files = st.file_uploader("Upload Photos", type=["jpg","jpeg","png"], accept_multiple_files=True)
+    if files:
+        for f in files:
+            st.session_state.batch.append({
+                "img": f.read(),
+                "qty": "",
+                "reason": ""
+            })
 
-if img_bytes:
-    st.image(img_bytes, caption="Preview", use_column_width=True)
+# =====================================================================
+# SHOW BATCH
+# =====================================================================
+st.subheader("Photos Added")
 
-    reason = st.selectbox("Reason", ["Scratched","Broken","Missing","KV Production Issue"])
-    notes = st.text_area("Notes (Qty required here)")
+if len(st.session_state.batch) == 0:
+    st.info("No photos added yet.")
+else:
+    remove_indices = []
 
-    if st.button("Process & Send"):
-        with st.spinner("Extracting…"):
+    for i, entry in enumerate(st.session_state.batch):
+        st.write(f"### Photo {i+1}")
+        st.image(entry["img"], use_column_width=True)
 
-            prep = preprocess(img_bytes)
-            raw = ocr_raw(prep)
+        entry["qty"] = st.text_input(f"Qty for Photo {i+1}", value=entry["qty"] or "", key=f"qty{i}")
+        entry["reason"] = st.text_input(f"Reason for Photo {i+1}", value=entry["reason"] or "", key=f"reason{i}")
 
-            size = extract_size(raw)
-            gtype = extract_type(raw)
-            tag = extract_tag(raw)
-            po = extract_po(raw)
+        if st.button(f"Remove Photo {i+1}", key=f"remove{i}"):
+            remove_indices.append(i)
 
-            qty_m = re.search(r"\b\d+\b", notes)
-            qty = qty_m.group(0) if qty_m else ""
+    for idx in sorted(remove_indices, reverse=True):
+        del st.session_state.batch[idx]
 
-            # One row table
-            row = f"index | Size | Type | Tag# | PO# | Qty | Reason\n" \
-                  f"1 | {size} | {gtype} | {tag} | {po} | {qty} | {reason}"
+# =====================================================================
+# PROCESS AND SEND ALL
+# =====================================================================
+if len(st.session_state.batch) > 0:
+    if st.button("Process & Send All"):
+        with st.spinner("Processing all photos…"):
 
-            st.code(row)
+            rows = []
+            csv_buffer = io.StringIO()
+            csv_writer = csv.writer(csv_buffer)
 
-            # CSV
-            buf = io.StringIO()
-            writer = csv.writer(buf)
-            writer.writerow(["index","Size","Type","Tag#","PO#","Qty","Reason"])
-            writer.writerow(["1", size, gtype, tag, po, qty, reason])
-            csv_bytes = buf.getvalue().encode()
+            csv_writer.writerow(["index", "Size", "Type", "Tag#", "PO#", "Qty", "Reason"])
 
-            send_email(row, csv_bytes, img_bytes)
+            images = []
 
-            st.success("Report sent successfully!")
+            for i, entry in enumerate(st.session_state.batch, start=1):
+                img_bytes = entry["img"]
+                images.append(img_bytes)
+
+                raw = ocr_raw(preprocess(img_bytes))
+
+                size = extract_size(raw)
+                gtype = extract_type(raw)
+                tag = extract_tag(raw)
+                po = extract_po(raw)
+                qty = entry["qty"]
+                reason = entry["reason"]
+
+                rows.append(f"{i} | {size} | {gtype} | {tag} | {po} | {qty} | {reason}")
+                csv_writer.writerow([i, size, gtype, tag, po, qty, reason])
+
+            table_string = "index | Size | Type | Tag# | PO# | Qty | Reason\n" + "\n".join(rows)
+
+            csv_bytes = csv_buffer.getvalue().encode()
+
+            send_email(table_string, csv_bytes, images)
+
+            st.success("All photos processed & email sent!")
+
+            st.session_state.batch = []
