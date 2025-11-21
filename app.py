@@ -211,7 +211,7 @@ if len(st.session_state.batch) > 0:
                 f"{len(rows)+1:<3} {time:<20} {reason:<20} {qty:<4} {tag:<10} {size:<20} {gtype:<20} {notes}"
             )
 
-            attachments.append(img_bytes)
+            attachments.append((f"label_{len(rows)+1}.jpg", img_bytes))
 
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
         subject = f"Glass Damage Batch Report – {timestamp}"
