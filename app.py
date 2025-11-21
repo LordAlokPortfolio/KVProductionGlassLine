@@ -66,7 +66,13 @@ def send_email(subject, body, attachments=None, to_list=None, cc_list=None):
 # =====================================================================
 def run_ocr(image_file):
     try:
-        img = Image.open(image_file)
+        # FIX: extract bytes correctly
+        if hasattr(image_file, "getvalue"):
+            raw = image_file.getvalue()
+        else:
+            raw = image_file.read()
+
+        img = Image.open(BytesIO(raw))
         buf = BytesIO()
         img.save(buf, format="JPEG", quality=90)
         b64_img = base64.b64encode(buf.getvalue()).decode()
@@ -79,7 +85,7 @@ SIZE: (format: 12.5 x 34.75)
 QTY: (1 digit)
 TYPE: (CLT, LOWE, CLEAR, BRONZE, LAMI, E180, Q180, i89, etc.)
 
-Format answer EXACTLY like this:
+FORMAT:
 TAG: xxx
 SIZE: xxx
 QTY: xxx
@@ -105,20 +111,16 @@ TYPE: xxx
 
         txt = response.choices[0].message.content
 
-        tag = re.search(r"TAG:\s*(.*)", txt)
-        size = re.search(r"SIZE:\s*(.*)", txt)
-        qty = re.search(r"QTY:\s*(.*)", txt)
-        gtype = re.search(r"TYPE:\s*(.*)", txt)
-
         return {
-            "tag": tag.group(1).strip() if tag else "OCR ERROR",
-            "size": size.group(1).strip() if size else "OCR ERROR",
-            "qty": qty.group(1).strip() if qty else "1",
-            "type": gtype.group(1).strip() if gtype else "OCR ERROR",
+            "tag": re.search(r"TAG:\s*(.*)", txt).group(1).strip() if re.search(r"TAG:", txt) else "OCR ERROR",
+            "size": re.search(r"SIZE:\s*(.*)", txt).group(1).strip() if re.search(r"SIZE:", txt) else "OCR ERROR",
+            "qty": re.search(r"QTY:\s*(.*)", txt).group(1).strip() if re.search(r"QTY:", txt) else "1",
+            "type": re.search(r"TYPE:\s*(.*)", txt).group(1).strip() if re.search(r"TYPE:", txt) else "OCR ERROR",
         }
 
     except Exception:
         return {"tag": "OCR ERROR", "size": "OCR ERROR", "qty": "1", "type": "OCR ERROR"}
+
 
 
 # =====================================================================
