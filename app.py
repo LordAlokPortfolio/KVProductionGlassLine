@@ -139,22 +139,35 @@ if "batch" not in st.session_state:
     st.session_state.batch = []
 
 
-# ==============================
-# IMAGE UPLOAD (Gallery Only)
-# ==============================
-photo = st.file_uploader("Upload Label Photo (JPG/PNG)", type=["jpg", "jpeg", "png"])
+# ====================================
+# MULTI-PHOTO GALLERY UPLOAD
+# ====================================
+photos = st.file_uploader(
+    "Upload one or more label photos (JPG/PNG)",
+    type=["jpg", "jpeg", "png"],
+    accept_multiple_files=True
+)
 
-if photo:
-    img_bytes = photo.read()
+# Debug list to hold processed images
+uploaded_images = []
 
-    # Debugger
-    st.write("DEBUG — IMAGE BYTES:", len(img_bytes))
+if photos:
+    for p in photos:
+        img_bytes = p.read()
 
-    if len(img_bytes) < 5000:
-        st.error("Image file seems empty or corrupted. Please upload again.")
-        st.stop()
-else:
-    img_bytes = None
+        # Debugger per-image
+        st.write(f"DEBUG – {p.name} – BYTES:", len(img_bytes))
+
+        if len(img_bytes) < 5000:
+            st.error(f"{p.name} is corrupted or empty. Re-upload that image.")
+            st.stop()
+
+        uploaded_images.append(img_bytes)
+
+# If user clicks submit with no images
+if not photos:
+    uploaded_images = []
+
 
 
 
