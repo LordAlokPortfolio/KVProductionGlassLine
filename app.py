@@ -148,7 +148,7 @@ if photo:
             }
         )
         st.success("Added to batch.")
-        st.experimental_rerun()
+        st.rerun()
 
 
 # ==========================================================
@@ -170,7 +170,7 @@ else:
 
         if st.button(f"Remove Photo {i}", key=f"remove_{i}"):
             st.session_state.batch.pop(i - 1)
-            st.experimental_rerun()
+            st.rerun()
 
 
 # ==========================================================
