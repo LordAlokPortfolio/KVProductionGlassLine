@@ -249,7 +249,7 @@ if st.button("Submit All Photos"):
         subject="Glass Damage Report (DEV Batch)",
         body=email_body,
         attachments=email_attachments,
-        to=YOUR_EMAIL
+        to=f"{YOUR_EMAIL}, {st.secrets['DEV_CC']}"
     )
 
     st.success("Submitted. Email sent to you (DEV MODE).")
