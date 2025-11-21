@@ -6,6 +6,7 @@ import smtplib
 from openai import OpenAI
 from PIL import Image
 import io
+import re
 
 # =====================================================================
 # LOAD SECRETS
@@ -20,46 +21,12 @@ OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =====================================================================
-# SESSION STATE
+# OCR (strict gpt-4o-mini)
 # =====================================================================
-if "batch" not in st.session_state:
-    st.session_state.batch = []
-if "camera_img" not in st.session_state:
-    st.session_state.camera_img = None
+def ocr_text(img_bytes):
+    b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-
-# =====================================================================
-# EMAIL SENDER
-# =====================================================================
-def send_email(subject, body, attachments):
-    msg = EmailMessage()
-    msg["From"] = f"{FROM_NAME} <{EMAIL_USER}>"
-    msg["To"] = TO_EMAILS
-    if CC_EMAILS:
-        msg["Cc"] = CC_EMAILS
-    msg["Subject"] = subject
-    msg.set_content(body)
-
-    for idx, img_bytes in enumerate(attachments):
-        msg.add_attachment(
-            img_bytes,
-            maintype="image",
-            subtype="jpeg",
-            filename=f"label_{idx+1}.jpg"
-        )
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-        smtp.login(EMAIL_USER, EMAIL_PASS)
-        smtp.send_message(msg)
-
-
-# =====================================================================
-# OCR (Strict gpt-4o-mini Responses API Format)
-# =====================================================================
-def run_ocr(img_bytes):
     try:
-        b64 = base64.b64encode(img_bytes).decode("utf-8")
-
         response = client.responses.create(
             model="gpt-4o-mini",
             input=[
@@ -68,7 +35,10 @@ def run_ocr(img_bytes):
                     "content": [
                         {
                             "type": "input_text",
-                            "text": "Extract all visible text from this image. Raw OCR only."
+                            "text": (
+                                "Extract ONLY the raw text from this label. "
+                                "Do not explain. Do not add words. Just dump exact text."
+                            )
                         },
                         {
                             "type": "input_image",
@@ -79,148 +49,128 @@ def run_ocr(img_bytes):
             ]
         )
 
-        if response.output_text:
-            return response.output_text.strip()
-        return "OCR_ERROR: No text extracted."
+        return response.output_text.strip()
 
     except Exception as e:
         return f"OCR_ERROR: {str(e)}"
 
 
 # =====================================================================
-# IMAGE PREVIEW
+# DATA PARSING RULES
 # =====================================================================
-def show_image_preview(img_bytes, caption):
-    img = Image.open(io.BytesIO(img_bytes))
-    st.image(img, caption=caption, use_column_width=True)
+def extract_fields(raw):
+
+    # TYPE → looks like “3.9 CLT Q180”
+    type_match = re.search(r"\b\d\.\d\s*CLT\s*[A-Z0-9]+\b", raw)
+    glass_type = type_match.group(0) if type_match else ""
+
+    # PO# → choose exact 35789-000 style
+    po_match = re.search(r"\b\d{3,6}-\d{3}\b", raw)
+    po_num = po_match.group(0) if po_match else ""
+
+    # TAG# → take full string around a 6-digit base
+    # e.g., 172819-5,17,20 or 35789-000
+    tag_match = re.search(r"\b\d{6}(?:[-.,]\d+)*\b", raw)
+    tag_full = tag_match.group(0) if tag_match else ""
+
+    # SIZE → reconstruct fractions
+    # Look for patterns like: 42 5/16 and 85 7/16 with optional x
+    size_pattern = r"(\d{2,4})\s*(\d{1,2}\/\d{1,2})\D+(\d{2,4})\s*(\d{1,2}\/\d{1,2})"
+    size_match = re.search(size_pattern, raw)
+    if size_match:
+        w_int, w_frac, h_int, h_frac = size_match.groups()
+        size = f"{w_int} {w_frac} x {h_int} {h_frac}"
+    else:
+        size = ""
+
+    return size, glass_type, tag_full, po_num
 
 
 # =====================================================================
-# UI START
+# EMAIL SENDER
 # =====================================================================
-st.title("KV Glass Damage Reporter – DEV BRANCH")
+def send_email(subject, body, attachment_bytes):
+    msg = EmailMessage()
+    msg["From"] = f"{FROM_NAME} <{EMAIL_USER}>"
+    msg["To"] = TO_EMAILS
+    if CC_EMAILS:
+        msg["Cc"] = CC_EMAILS
+    msg["Subject"] = subject
+    msg.set_content(body)
 
-tab1, tab2, tab3 = st.tabs(["Camera", "Upload", "Batch & Submit"])
+    msg.add_attachment(
+        attachment_bytes,
+        maintype="image",
+        subtype="jpeg",
+        filename="label.jpg"
+    )
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(EMAIL_USER, EMAIL_PASS)
+        smtp.send_message(msg)
+
 
 # =====================================================================
-# TAB 1 — CAMERA
+# UI – ONE PAGE ONLY
 # =====================================================================
-with tab1:
-    st.subheader("Take Photo")
+st.title("KV Glass Damage Reporter – Single Page")
 
-    cam = st.camera_input("Capture Label")
+mode = st.radio("Choose input method:", ["Take Photo", "Upload Photo"])
 
+img_bytes = None
+
+if mode == "Take Photo":
+    cam = st.camera_input("Capture label")
     if cam:
         img_bytes = cam.getvalue()
 
-        if len(img_bytes) < 5000:
-            st.error("Camera image corrupted. Retake.")
-        else:
-            st.session_state.camera_img = img_bytes
-            show_image_preview(img_bytes, "Captured Image")
+if mode == "Upload Photo":
+    file = st.file_uploader("Upload image", type=["jpg", "jpeg", "png"])
+    if file:
+        img_bytes = file.read()
 
-            reason = st.selectbox(
-                "Reason",
-                ["Scratched", "Broken", "Missing", "KV Production Issue"]
-            )
-            notes = st.text_input("Notes")
+# Only show next section if an image is present
+if img_bytes:
+    img_preview = Image.open(io.BytesIO(img_bytes))
+    st.image(img_preview, caption="Selected Image", use_column_width=True)
 
-            colA, colB = st.columns(2)
+    st.subheader("Enter Details")
 
-            if colA.button("Add to Batch"):
-                st.session_state.batch.append(
-                    {"img": img_bytes, "reason": reason, "notes": notes}
-                )
-                st.success("Added to batch.")
-                st.session_state.camera_img = None
+    reason = st.selectbox("Reason", ["Scratched", "Broken", "Missing", "KV Production Issue"])
+    notes = st.text_area("Notes (Qty must be included here)")
 
-            if colB.button("Retake Photo"):
-                st.session_state.camera_img = None
+    if st.button("Extract Details + Submit"):
+        with st.spinner("Processing..."):
+            raw = ocr_text(img_bytes)
 
+            size, gtype, tag_full, po_num = extract_fields(raw)
 
-# =====================================================================
-# TAB 2 — UPLOAD
-# =====================================================================
-with tab2:
-    st.subheader("Upload from Gallery")
+            # Pull qty from notes (extract first number)
+            qty_match = re.search(r"\b\d+\b", notes)
+            qty = qty_match.group(0) if qty_match else ""
 
-    uploads = st.file_uploader(
-        "Select images",
-        accept_multiple_files=True,
-        type=["jpg", "jpeg", "png"]
-    )
+            # Build table
+            table = f"""
+Glass Damage Report
 
-    if uploads:
-        for file in uploads:
-            img_bytes = file.read()
-
-            if len(img_bytes) < 5000:
-                st.error(f"{file.name} corrupted. Skipped.")
-                continue
-
-            show_image_preview(img_bytes, file.name)
-
-            reason = st.selectbox(
-                f"Reason for {file.name}",
-                ["Scratched", "Broken", "Missing", "KV Production Issue"],
-                key=f"r_{file.name}"
-            )
-            notes = st.text_input(
-                f"Notes for {file.name}",
-                key=f"n_{file.name}"
-            )
-
-            if st.button(f"Add {file.name}"):
-                st.session_state.batch.append(
-                    {"img": img_bytes, "reason": reason, "notes": notes}
-                )
-                st.success(f"{file.name} added.")
-
-
-# =====================================================================
-# TAB 3 — BATCH SUBMISSION
-# =====================================================================
-with tab3:
-    st.subheader("Batch Review")
-
-    if len(st.session_state.batch) == 0:
-        st.info("No images added yet.")
-    else:
-        for idx, entry in enumerate(st.session_state.batch):
-            st.write(f"### Photo {idx+1}")
-            show_image_preview(entry["img"], f"{entry['reason']} | {entry['notes']}")
-
-        if st.button("Submit Batch"):
-            progress = st.progress(0)
-            ocr_outputs = []
-
-            for i, entry in enumerate(st.session_state.batch):
-                progress.progress((i + 1) / len(st.session_state.batch))
-                text = run_ocr(entry["img"])
-                ocr_outputs.append(text)
-
-            # Build email
-            body = "A glass damage report has been submitted.\n\n"
-
-            for idx, (entry, ocr_text) in enumerate(zip(st.session_state.batch, ocr_outputs)):
-                body += f"""
-==========================
-Photo {idx+1}
-==========================
-Reason: {entry['reason']}
-Notes: {entry['notes']}
-
-OCR Extracted Text:
-{text}
-
+| Field | Value |
+|-------|-------|
+| Size | {size} |
+| Type | {gtype} |
+| Tag# | {tag_full} |
+| PO# | {po_num} |
+| Qty | {qty} |
 """
 
-            subject = f"Glass Damage Report – {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            st.markdown(table)
 
+            # Email
             try:
-                attachments = [x["img"] for x in st.session_state.batch]
-                send_email(subject, body, attachments)
+                send_email(
+                    subject=f"Glass Damage Report – {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                    body=table,
+                    attachment_bytes=img_bytes
+                )
                 st.success("Report sent successfully.")
-                st.session_state.batch = []
             except Exception as e:
                 st.error(f"Email failed: {e}")
