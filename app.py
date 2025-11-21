@@ -4,6 +4,8 @@ from datetime import datetime
 from email.message import EmailMessage
 from openai import OpenAI
 from PIL import Image, ImageEnhance, ImageOps
+import openai
+st.write("OpenAI SDK:", openai.__version__)
 
 # ==========================================================
 # SECRETS
