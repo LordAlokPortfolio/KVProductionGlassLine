@@ -62,7 +62,6 @@ def run_ocr(img_bytes):
 
         response = client.responses.create(
             model="gpt-4o-mini",
-            reasoning={"effort": "medium"},
             input=[
                 {
                     "role": "user",
