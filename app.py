@@ -1,279 +1,218 @@
 import streamlit as st
-import requests
-import base64
 import io
 from PIL import Image
-from datetime import datetime, time as dtime
-import csv
-import smtplib
+from datetime import datetime
 from email.message import EmailMessage
+import smtplib
+import base64
+from openai import OpenAI
 
-# =========================================================
-# LOAD SECRETS (dev branch → ONLY YOU receive emails)
-# =========================================================
+# ==========================================================
+# LOAD SECRETS (DEV MODE → ONLY EMAIL YOU AND NING)
+# ==========================================================
+
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 EMAIL_USER = st.secrets["EMAIL_USER"]
 EMAIL_PASS = st.secrets["EMAIL_PASS"]
-FROM_NAME = st.secrets["FROM_NAME"]
-YOUR_EMAIL = st.secrets["YOUR_EMAIL"]
-ADMIN_PIN = st.secrets["ADMIN_PIN"]
 
-# =========================================================
-# EMAIL SENDER (SMTP)
-# =========================================================
-def send_email(subject, body, attachments=None, to=None):
+TO_EMAILS = st.secrets["TO_EMAILS"]        # only YOU
+CC_EMAILS = st.secrets["CC_EMAILS"]        # you + ning
+
+# ==========================================================
+# OPENAI CLIENT
+# ==========================================================
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# ==========================================================
+# OCR FUNCTION (OpenAI gpt-4o-mini vision)
+# ==========================================================
+def run_ocr(image_bytes):
+    try:
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        prompt_text = """
+You are reading a glass manufacturing label.
+
+Extract ONLY:
+• Tag Number (digits only, no PD/WD/ED/SU)
+• Size
+• Glass Type
+• Qty on Label
+
+Return as JSON with keys: tag, size, type, qty
+Do NOT add commentary.
+"""
+
+        response = client.responses.create(
+            model="gpt-4o-mini",
+            input=[
+                {"role": "user", "content": prompt_text},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:image/jpeg;base64,{b64}"
+                        }
+                    ],
+                },
+            ],
+        )
+
+        raw = response.output_text
+
+        # Extract JSON safely
+        import json
+        try:
+            data = json.loads(raw)
+            return (
+                data.get("tag", "NOT FOUND"),
+                data.get("size", "NOT FOUND"),
+                data.get("type", "NOT FOUND"),
+                data.get("qty", "NOT FOUND"),
+            )
+        except:
+            return ("NOT FOUND", "NOT FOUND", "NOT FOUND", "NOT FOUND")
+
+    except Exception as e:
+        return ("OCR ERROR", "OCR ERROR", "OCR ERROR", "OCR ERROR")
+
+
+# ==========================================================
+# EMAIL FUNCTION
+# ==========================================================
+def send_email(subject, body, attachments):
     msg = EmailMessage()
-    msg["From"] = f"{FROM_NAME} <{EMAIL_USER}>"
-    msg["To"] = to
+    msg["From"] = EMAIL_USER
+    msg["To"] = TO_EMAILS
+    msg["Cc"] = CC_EMAILS
     msg["Subject"] = subject
     msg.set_content(body)
 
-    if attachments:
-        for filename, data in attachments.items():
-            msg.add_attachment(
-                data,
-                maintype="application",
-                subtype="octet-stream",
-                filename=filename
-            )
+    for idx, img_bytes in enumerate(attachments, start=1):
+        msg.add_attachment(
+            img_bytes,
+            maintype="image",
+            subtype="jpeg",
+            filename=f"label_{idx}.jpg"
+        )
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+    with smtplib.SMTP_SSL("smtp.mail.me.com", 465) as smtp:
         smtp.login(EMAIL_USER, EMAIL_PASS)
         smtp.send_message(msg)
 
-# =========================================================
-# OPENAI OCR FUNCTION
-# =========================================================
-def ocr_with_openai(image_bytes):
-    b64 = base64.b64encode(image_bytes).decode()
 
-    payload = {
-        "model": "gpt-4o-mini",
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": (
-                            "Extract strictly from the label:\n"
-                            "• TAG number\n"
-                            "• SIZE\n"
-                            "• QTY\n"
-                            "• GLASS TYPE\n"
-                            "Return only clean values without commentary."
-                        )
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": f"data:image/jpeg;base64,{b64}"
-                    }
-                ]
-            }
-        ]
-    }
+# ==========================================================
+# SESSION STATE SETUP
+# ==========================================================
+if "batch" not in st.session_state:
+    st.session_state.batch = []   # list of dicts with photo + details
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {OPENAI_API_KEY}"
-    }
 
-    try:
-        resp = requests.post(
-            "https://api.openai.com/v1/responses",
-            json=payload,
-            headers=headers,
-            timeout=40
-        )
-        text = resp.json()["output_text"]
-        return parse_ocr_text(text)
-    except:
-        return {
-            "tag": "NOT FOUND",
-            "size": "NOT FOUND",
-            "qty": "NOT FOUND",
-            "glass": "NOT FOUND"
-        }
+# ==========================================================
+# UI TITLE
+# ==========================================================
+st.title("KV Glass Reporter – DEV v5")
 
-# Simple key extractor
-def parse_ocr_text(text):
-    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
-    data = {"tag": "NOT FOUND", "size": "NOT FOUND", "qty": "NOT FOUND", "glass": "NOT FOUND"}
 
-    for ln in lines:
-        u = ln.upper()
-        if "TAG" in u or "LABEL" in u:
-            data["tag"] = ln.split(":")[-1].strip()
-        elif "SIZE" in u:
-            data["size"] = ln.split(":")[-1].strip()
-        elif "QTY" in u or "QUANTITY" in u:
-            data["qty"] = ln.split(":")[-1].strip()
-        elif "TYPE" in u or "GLASS" in u or "SPEC" in u:
-            data["glass"] = ln.split(":")[-1].strip()
+# ==========================================================
+# TAKE PHOTO SECTION
+# ==========================================================
+st.subheader("1. Take Photo")
 
-    return data
-
-# =========================================================
-# DEV VOLATILE MEMORY (RAM ONLY)
-# =========================================================
-if "photos" not in st.session_state:
-    st.session_state["photos"] = []
-
-if "records" not in st.session_state:
-    st.session_state["records"] = []
-
-if "last_export" not in st.session_state:
-    st.session_state["last_export"] = None
-
-# =========================================================
-# AUTO EXPORT LOGIC
-# =========================================================
-EXPORT_TIMES = [
-    dtime(9,0),
-    dtime(12,0),
-    dtime(15,0),
-    dtime(18,0),
-    dtime(21,0)
-]
-
-SATURDAY_EXPORT = [
-    dtime(9,0),
-    dtime(12,0)
-]
-
-def is_export_time(now):
-    wd = now.weekday()
-    now_clean = now.time().replace(second=0, microsecond=0)
-
-    if wd == 5:  # Saturday
-        return now_clean in SATURDAY_EXPORT
-
-    if wd in [0,1,2,3,4]:  # Weekdays
-        return now_clean in EXPORT_TIMES
-
-    return False  # Sunday
-
-def auto_export_check():
-    now = datetime.now()
-    if not is_export_time(now):
-        return
-
-    slot = now.strftime("%H:%M")
-
-    if st.session_state["last_export"] == slot:
-        return
-
-    if len(st.session_state["records"]) > 0:
-        export_records()
-
-    st.session_state["records"] = []
-    st.session_state["last_export"] = slot
-
-def export_records():
-    rows = st.session_state["records"]
-    csv_buf = io.StringIO()
-    writer = csv.writer(csv_buf)
-    writer.writerow(["Timestamp", "Tag", "Size", "Qty", "Glass"])
-
-    for row in rows:
-        writer.writerow(row)
-
-    csv_bytes = csv_buf.getvalue().encode()
-
-    send_email(
-        subject="KV Glass Auto Export (DEV)",
-        body="Attached is the scheduled export.",
-        attachments={"export.csv": csv_bytes},
-        to=YOUR_EMAIL
-    )
-
-# =========================================================
-# UI — PHONE OPTIMIZED
-# =========================================================
-st.title("KV Glass Damage Reporter — DEV v3")
-
-st.write("Take up to **5 photos**, then press **Submit All Photos**.")
-
-photo = st.camera_input("Take Photo", key="cam")
+photo = st.camera_input("Take a photo of the glass label")
 
 if photo:
-    if len(st.session_state["photos"]) < 5:
-        st.session_state["photos"].append(photo.getvalue())
-        st.success(f"Photo added ({len(st.session_state['photos'])}/5).")
-    else:
-        st.error("Maximum 5 photos reached.")
+    st.image(photo, caption="Captured Label", use_column_width=True)
 
-if st.button("Retake / Clear All Photos"):
-    st.session_state["photos"] = []
-    st.experimental_rerun()
+    # Per-photo inputs
+    st.subheader("2. Enter Details")
 
-# =========================================================
-# SUBMIT ALL PHOTOS
-# =========================================================
-if st.button("Submit All Photos"):
-    if len(st.session_state["photos"]) == 0:
-        st.error("No photos taken.")
-        st.stop()
-
-    ocr_results = []
-    email_attachments = {}
-
-    with st.spinner("Processing all photos..."):
-        for i, img_bytes in enumerate(st.session_state["photos"]):
-            ocr = ocr_with_openai(img_bytes)
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-            ocr_results.append((timestamp, ocr["tag"], ocr["size"], ocr["qty"], ocr["glass"]))
-
-            st.session_state["records"].append([
-                timestamp,
-                ocr["tag"],
-                ocr["size"],
-                ocr["qty"],
-                ocr["glass"]
-            ])
-
-            email_attachments[f"label_{i+1}.jpg"] = img_bytes
-
-    # Build email
-    body_lines = ["Multiple glass defects were reported:\n"]
-    for r in ocr_results:
-        ts, tag, size, qty, glass = r
-        body_lines.append(
-            f"• {ts} — TAG:{tag}, Size:{size}, Qty:{qty}, Glass:{glass}"
-        )
-
-    email_body = "\n".join(body_lines)
-
-    send_email(
-        subject="Glass Damage Report (DEV Batch)",
-        body=email_body,
-        attachments=email_attachments,
-        to=f"{YOUR_EMAIL}, {st.secrets['DEV_CC']}"
+    reason = st.selectbox(
+        "Reason",
+        ["Scratched", "KV Production Issue", "Broken", "Missing"]
     )
 
-    st.success("Submitted. Email sent to you (DEV MODE).")
-    st.session_state["photos"] = []
+    qty = st.number_input("Qty Needed", min_value=1, max_value=10, value=1)
 
-# =========================================================
-# AUTO-EXPORT ENGINE
-# =========================================================
-auto_export_check()
+    notes = st.text_input("Notes (optional)")
 
-# =========================================================
-# ADMIN PANEL
-# =========================================================
-st.sidebar.title("Admin")
-pin = st.sidebar.text_input("Enter PIN", type="password")
+    if st.button("Add to Batch"):
+        st.session_state.batch.append(
+            {
+                "img_bytes": photo.getvalue(),
+                "reason": reason,
+                "qty": qty,
+                "notes": notes,
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+        )
+        st.success("Added to batch.")
+        st.experimental_rerun()
 
-if pin == ADMIN_PIN:
-    st.sidebar.success("Admin Mode Active")
-    st.sidebar.write("Records in memory:", len(st.session_state["records"]))
-    if st.sidebar.button("Force Export Now"):
-        if len(st.session_state["records"]) == 0:
-            st.sidebar.warning("No records to export.")
-        else:
-            export_records()
-            st.sidebar.success("Manual export completed.")
+
+# ==========================================================
+# BATCH PREVIEW SECTION
+# ==========================================================
+st.subheader("3. Items in Batch")
+
+if len(st.session_state.batch) == 0:
+    st.info("No photos added yet.")
+
 else:
-    st.sidebar.info("Enter PIN to access admin panel.")
+    for i, item in enumerate(st.session_state.batch, start=1):
+        st.markdown(f"### Photo {i}")
+        st.image(item["img_bytes"], width=250)
+        st.write(f"• **Reason:** {item['reason']}")
+        st.write(f"• **Qty:** {item['qty']}")
+        st.write(f"• **Notes:** {item['notes'] or '—'}")
+        st.write(f"• **Time:** {item['time']}")
+
+        if st.button(f"Remove Photo {i}", key=f"remove_{i}"):
+            st.session_state.batch.pop(i - 1)
+            st.experimental_rerun()
+
+
+# ==========================================================
+# SUBMIT BATCH
+# ==========================================================
+if len(st.session_state.batch) > 0:
+    st.subheader("4. Submit")
+
+    if st.button("Submit Batch (Email)"):
+        rows = []
+        attachments = []
+
+        for item in st.session_state.batch:
+            img_bytes = item["img_bytes"]
+            reason = item["reason"]
+            qty = item["qty"]
+            notes = item["notes"]
+            time = item["time"]
+
+            # OCR
+            tag, size, gtype, ocr_qty = run_ocr(img_bytes)
+
+            rows.append(
+                f"{len(rows)+1:<3} {time:<20} {reason:<20} {qty:<4} {tag:<10} {size:<20} {gtype:<20} {notes}"
+            )
+
+            attachments.append(img_bytes)
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        subject = f"Glass Damage Batch Report – {timestamp}"
+
+        header = (
+            "No  Time                 Reason               Qty  Tag        Size                 Type                 Notes\n"
+            "---------------------------------------------------------------------------------------------------------------"
+        )
+
+        body = header + "\n" + "\n".join(rows)
+
+        try:
+            send_email(subject, body, attachments)
+            st.success("Batch sent successfully.")
+            st.session_state.batch = []
+        except Exception as e:
+            st.error(f"Email failed: {e}")
+
