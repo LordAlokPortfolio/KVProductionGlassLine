@@ -1,28 +1,23 @@
 import streamlit as st
-import base64, hashlib, io, csv, re, smtplib, os
+import base64, hashlib, io, csv, re, smtplib
 from datetime import datetime
 from email.message import EmailMessage
-from openai import OpenAI
-import openai
+import openai  # << use global client
 
-# TEMP VERSION CHECK
 st.write("OpenAI SDK:", openai.__version__)
 
 # ==========================================================
-# SETUP OPENAI CLIENT (IMPORTANT: NO ARGUMENTS)
+# SECRETS
 # ==========================================================
+EMAIL_USER = st.secrets["EMAIL_USER"]
+EMAIL_PASS = st.secrets["EMAIL_PASS"]
+FROM_NAME  = st.secrets["FROM_NAME"]
+TO_EMAILS  = st.secrets["TO_EMAILS"]
+CC_EMAILS  = st.secrets.get("CC_EMAILS", "")
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-client = OpenAI()
 
-# ==========================================================
-# EMAIL CONFIG
-# ==========================================================
-EMAIL_USER  = st.secrets["EMAIL_USER"]
-EMAIL_PASS  = st.secrets["EMAIL_PASS"]
-FROM_NAME   = st.secrets["FROM_NAME"]
-TO_EMAILS   = st.secrets["TO_EMAILS"]
-CC_EMAILS   = st.secrets.get("CC_EMAILS","")
+openai.api_key = OPENAI_API_KEY  # << FIXED
+
 
 # ==========================================================
 # CONSTANTS
@@ -53,7 +48,7 @@ if "queue_ready" not in st.session_state: st.session_state.queue_ready = False
 def ocr_raw(img_bytes):
     b64 = base64.b64encode(img_bytes).decode()
     try:
-        r = client.responses.create(
+        r = openai.responses.create(
             model="gpt-4o-mini",
             input=[{
                 "role": "user",
