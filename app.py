@@ -1,6 +1,5 @@
 import streamlit as st
 import base64
-import time
 from datetime import datetime
 from email.message import EmailMessage
 import smtplib
@@ -16,7 +15,6 @@ EMAIL_PASS = st.secrets["EMAIL_PASS"]
 FROM_NAME = st.secrets["FROM_NAME"]
 TO_EMAILS = st.secrets["TO_EMAILS"]
 CC_EMAILS = st.secrets["CC_EMAILS"]
-ADMIN_PIN = st.secrets["ADMIN_PIN"]
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -56,7 +54,7 @@ def send_email(subject, body, attachments):
 
 
 # =====================================================================
-# OCR (Correct 4o-mini format)
+# OCR (Strict gpt-4o-mini Responses API Format)
 # =====================================================================
 def run_ocr(img_bytes):
     try:
@@ -69,24 +67,29 @@ def run_ocr(img_bytes):
                 {
                     "role": "user",
                     "content": [
-                        {"type": "input_text", "text": "Extract all visible text from this image. Do not interpret. Raw OCR only."},
+                        {
+                            "type": "input_text",
+                            "text": "Extract all visible text from this image. Raw OCR only."
+                        },
                         {
                             "type": "input_image",
-                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+                            "image_url": f"data:image/jpeg;base64,{b64}"
                         }
                     ]
                 }
             ]
         )
 
-        return response.output_text.strip() if response.output_text else "OCR_ERROR: No text extracted."
+        if response.output_text:
+            return response.output_text.strip()
+        return "OCR_ERROR: No text extracted."
 
     except Exception as e:
         return f"OCR_ERROR: {str(e)}"
 
 
 # =====================================================================
-# IMAGE PREVIEW HELPER
+# IMAGE PREVIEW
 # =====================================================================
 def show_image_preview(img_bytes, caption):
     img = Image.open(io.BytesIO(img_bytes))
@@ -110,6 +113,7 @@ with tab1:
 
     if cam:
         img_bytes = cam.getvalue()
+
         if len(img_bytes) < 5000:
             st.error("Camera image corrupted. Retake.")
         else:
@@ -122,15 +126,16 @@ with tab1:
             )
             notes = st.text_input("Notes")
 
-            cols = st.columns(2)
-            if cols[0].button("Add to Batch"):
+            colA, colB = st.columns(2)
+
+            if colA.button("Add to Batch"):
                 st.session_state.batch.append(
                     {"img": img_bytes, "reason": reason, "notes": notes}
                 )
                 st.success("Added to batch.")
                 st.session_state.camera_img = None
 
-            if cols[1].button("Retake Photo"):
+            if colB.button("Retake Photo"):
                 st.session_state.camera_img = None
 
 
@@ -159,11 +164,11 @@ with tab2:
             reason = st.selectbox(
                 f"Reason for {file.name}",
                 ["Scratched", "Broken", "Missing", "KV Production Issue"],
-                key=f"reason_{file.name}"
+                key=f"r_{file.name}"
             )
             notes = st.text_input(
                 f"Notes for {file.name}",
-                key=f"notes_{file.name}"
+                key=f"n_{file.name}"
             )
 
             if st.button(f"Add {file.name}"):
@@ -180,7 +185,7 @@ with tab3:
     st.subheader("Batch Review")
 
     if len(st.session_state.batch) == 0:
-        st.info("No items in batch.")
+        st.info("No images added yet.")
     else:
         for idx, entry in enumerate(st.session_state.batch):
             st.write(f"### Photo {idx+1}")
@@ -195,10 +200,11 @@ with tab3:
                 text = run_ocr(entry["img"])
                 ocr_outputs.append(text)
 
-            email_body = "A glass damage report has been submitted.\n\n"
+            # Build email
+            body = "A glass damage report has been submitted.\n\n"
 
             for idx, (entry, ocr_text) in enumerate(zip(st.session_state.batch, ocr_outputs)):
-                email_body += f"""
+                body += f"""
 ==========================
 Photo {idx+1}
 ==========================
@@ -206,7 +212,7 @@ Reason: {entry['reason']}
 Notes: {entry['notes']}
 
 OCR Extracted Text:
-{ocr_text}
+{text}
 
 """
 
@@ -214,7 +220,7 @@ OCR Extracted Text:
 
             try:
                 attachments = [x["img"] for x in st.session_state.batch]
-                send_email(subject, email_body, attachments)
+                send_email(subject, body, attachments)
                 st.success("Report sent successfully.")
                 st.session_state.batch = []
             except Exception as e:
