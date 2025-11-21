@@ -61,7 +61,7 @@ def ocr_with_openai(image_bytes):
                             "• SIZE\n"
                             "• QTY\n"
                             "• GLASS TYPE\n"
-                            "Return clean values without extra commentary."
+                            "Return only clean values without commentary."
                         )
                     },
                     {
@@ -95,7 +95,7 @@ def ocr_with_openai(image_bytes):
             "glass": "NOT FOUND"
         }
 
-# Simple extractor
+# Simple key extractor
 def parse_ocr_text(text):
     lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
     data = {"tag": "NOT FOUND", "size": "NOT FOUND", "qty": "NOT FOUND", "glass": "NOT FOUND"}
@@ -158,18 +158,16 @@ def auto_export_check():
     if not is_export_time(now):
         return
 
-    current_slot = now.strftime("%H:%M")
+    slot = now.strftime("%H:%M")
 
-    # Prevent resend
-    if st.session_state["last_export"] == current_slot:
+    if st.session_state["last_export"] == slot:
         return
 
-    # If records exist → export
     if len(st.session_state["records"]) > 0:
         export_records()
 
     st.session_state["records"] = []
-    st.session_state["last_export"] = current_slot
+    st.session_state["last_export"] = slot
 
 def export_records():
     rows = st.session_state["records"]
@@ -190,13 +188,12 @@ def export_records():
     )
 
 # =========================================================
-# UI — CLEAN + PHONE OPTIMIZED
+# UI — PHONE OPTIMIZED
 # =========================================================
 st.title("KV Glass Damage Reporter — DEV v3")
 
 st.write("Take up to **5 photos**, then press **Submit All Photos**.")
 
-# CAMERA
 photo = st.camera_input("Take Photo", key="cam")
 
 if photo:
@@ -228,7 +225,6 @@ if st.button("Submit All Photos"):
 
             ocr_results.append((timestamp, ocr["tag"], ocr["size"], ocr["qty"], ocr["glass"]))
 
-            # Save to dev RAM
             st.session_state["records"].append([
                 timestamp,
                 ocr["tag"],
@@ -239,7 +235,7 @@ if st.button("Submit All Photos"):
 
             email_attachments[f"label_{i+1}.jpg"] = img_bytes
 
-    # Build email body
+    # Build email
     body_lines = ["Multiple glass defects were reported:\n"]
     for r in ocr_results:
         ts, tag, size, qty, glass = r
@@ -281,4 +277,3 @@ if pin == ADMIN_PIN:
             st.sidebar.success("Manual export completed.")
 else:
     st.sidebar.info("Enter PIN to access admin panel.")
-# =========================================================
