@@ -24,7 +24,7 @@ CC_EMAILS = st.secrets["CC_EMAILS"]
 ADMIN_PIN = st.secrets["ADMIN_PIN"]
 
 # DEBUG LINE
-st.write ("api KEY LOADED:", "OPENAI_API-KEY" in st.secrets)
+st.write ("api KEY LOADED:", bool(st.secrets.get("OPENAI_API_KEY")))
 
 # Convert comma-separated list → python list
 TO_LIST = [x.strip() for x in TO_EMAILS.split(",") if x.strip()]
@@ -232,3 +232,6 @@ Multiple glass defects were reported:<br><br>
 
         st.success("Batch submitted.")
         st.session_state.batch = []
+
+
+
