@@ -1,361 +1,280 @@
 import streamlit as st
-import base64
-import hashlib
-import io
-import csv
-import re
+import base64, hashlib, io, csv, re, smtplib
 from datetime import datetime
 from email.message import EmailMessage
-import smtplib
-
 from openai import OpenAI
 from PIL import Image, ImageEnhance, ImageOps
 
 # ==========================================================
-# LOAD SECRETS
+# SECRETS
 # ==========================================================
 EMAIL_USER = st.secrets["EMAIL_USER"]
 EMAIL_PASS = st.secrets["EMAIL_PASS"]
-FROM_NAME = st.secrets["FROM_NAME"]
-TO_EMAILS = st.secrets["TO_EMAILS"]
-CC_EMAILS = st.secrets.get("CC_EMAILS", "")
+FROM_NAME  = st.secrets["FROM_NAME"]
+TO_EMAILS  = st.secrets["TO_EMAILS"]
+CC_EMAILS  = st.secrets.get("CC_EMAILS","")
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ==========================================================
-# VALID SUFFIXES (tint layer)
+# CONSTANTS
 # ==========================================================
 VALID_SUFFIXES = [
-    "E180", "E180ESC", "Q180", "E272", "Q272",
-    "E366", "Q366", "EI89", "QI89",
-    "NREEDV", "MATT", "GRY", "P621", "BRZ"
+    "E180","E180ESC","Q180","E272","Q272",
+    "E366","Q366","EI89","QI89",
+    "NREEDV","MATT","GRY","P621","BRZ"
+]
+
+SIZE_REJECT_PATTERNS = [
+    r"\b20\d{2}\b",                 # years 2000-2099
+    r"\d{1,2}:\d{1,2}",             # colon codes 29:1:44
+    r"WO:", r"WD-"
 ]
 
 # ==========================================================
-# SESSION STATE
+# SESSION
 # ==========================================================
-if "batch" not in st.session_state:
-    st.session_state.batch = []
-
-if "added_keys" not in st.session_state:
-    st.session_state.added_keys = set()
-
-if "task_queue" not in st.session_state:
-    st.session_state.task_queue = []
-
+if "batch" not in st.session_state: st.session_state.batch=[]
+if "added_keys" not in st.session_state: st.session_state.added_keys=set()
+if "task_queue" not in st.session_state: st.session_state.task_queue=[]
 
 # ==========================================================
-# IMAGE PREPROCESSING FOR BETTER OCR
+# IMAGE PREPROCESS
 # ==========================================================
 def preprocess(img_bytes):
-    img = Image.open(io.BytesIO(img_bytes))
-    img = ImageOps.grayscale(img)
-    img = ImageEnhance.Contrast(img).enhance(2.0)
-    img = ImageEnhance.Sharpness(img).enhance(1.5)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=92)
+    img=Image.open(io.BytesIO(img_bytes))
+    img=ImageOps.grayscale(img)
+    img=ImageEnhance.Contrast(img).enhance(2.0)
+    img=ImageEnhance.Sharpness(img).enhance(1.5)
+    buf=io.BytesIO(); img.save(buf,format="JPEG",quality=92)
     return buf.getvalue()
 
-
 # ==========================================================
-# OCR RAW TEXT (GPT-4O-MINI)
+# OCR
 # ==========================================================
 def ocr_raw(img_bytes):
-    b64 = base64.b64encode(img_bytes).decode()
+    b64=base64.b64encode(img_bytes).decode()
     try:
-        r = client.responses.create(
+        r=client.responses.create(
             model="gpt-4o-mini",
             input=[{
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": "Extract raw text only. No explanation."},
-                    {"type": "input_image",
-                     "image_url": f"data:image/jpeg;base64,{b64}"}
+                "role":"user",
+                "content":[
+                    {"type":"input_text","text":"Extract raw text only."},
+                    {"type":"input_image","image_url":f"data:image/jpeg;base64,{b64}"}
                 ]
             }]
         )
         return r.output_text.strip()
     except Exception as e:
-        return f"OCR_ERROR: {e}"
-
+        return f"OCR_ERROR:{e}"
 
 # ==========================================================
-# PREFIX REPAIR: 39→3.9, 47→4.7, 57→5.7, etc.
+# PREFIX REPAIR
 # ==========================================================
 def repair_prefix(t):
-    patterns = {
-        r"\b3\s*9\b": "3.9", r"\b39\b": "3.9", r"\b3[-/:,_ ]+9\b": "3.9",
-        r"\b3\s*1\b": "3.1", r"\b31\b": "3.1", r"\b3[-/:,_ ]+1\b": "3.1",
-        r"\b4\s*7\b": "4.7", r"\b47\b": "4.7", r"\b4[-/:,_ ]+7\b": "4.7",
-        r"\b5\s*7\b": "5.7", r"\b57\b": "5.7", r"\b5[-/:,_ ]+7\b": "5.7",
+    patterns={
+        r"\b3\s*9\b":"3.9",r"\b39\b":"3.9",r"\b3[-/:,_ ]+9\b":"3.9",
+        r"\b3\s*1\b":"3.1",r"\b31\b":"3.1",r"\b3[-/:,_ ]+1\b":"3.1",
+        r"\b4\s*7\b":"4.7",r"\b47\b":"4.7",r"\b4[-/:,_ ]+7\b":"4.7",
+        r"\b5\s*7\b":"5.7",r"\b57\b":"5.7",r"\b5[-/:,_ ]+7\b":"5.7"
     }
-    for pat, rep in patterns.items():
-        t = re.sub(pat, rep, t)
+    for pat,rep in patterns.items(): t=re.sub(pat,rep,t)
     return t
 
-
-# ==========================================================
-# SUFFIX SIMILARITY (for tint correction)
-# ==========================================================
-def similarity(a, b):
-    a = a.upper()
-    b = b.upper()
-    return sum(1 for x, y in zip(a, b) if x == y)
-
+def similarity(a,b): return sum(1 for x,y in zip(a.upper(),b.upper()) if x==y)
 
 # ==========================================================
 # TYPE LINE → THICKNESS / TYPE / TINT
 # ==========================================================
 def extract_type_components(raw):
-    raw_clean = raw.replace("\r", "").replace("\n", "\n")
-    lines = raw_clean.split("\n")
-    
+    lines=[l.strip() for l in raw.split("\n") if l.strip()]
+
     # find Cut> line
-    cut_i = None
-    for i, line in enumerate(lines):
-        if "cut>" in line.lower():
-            cut_i = i
-            break
-    if cut_i is None:
-        return "", "", ""
+    ci=None
+    for i,l in enumerate(lines):
+        if "cut>" in l.lower():
+            ci=i; break
+    if ci is None: return "","",""
 
-    # TYPE is next non-empty line
-    type_line = ""
-    for j in range(cut_i + 1, len(lines)):
-        if lines[j].strip():
-            type_line = lines[j].strip()
-            break
+    # next non-empty line
+    if ci+1>=len(lines): return "","",""
+    tline=repair_prefix(lines[ci+1])
+    tline=re.sub(r"\s+"," ",tline)
+    tline=re.sub(r"C\s*L\s*T","CLT",tline)
+    tline=re.sub(r"C\s*L\s*A","CLA",tline)
 
-    if not type_line:
-        return "", "", ""
+    parts=tline.split()
+    if not parts: return "","",""
 
-    # clean spacing
-    t = repair_prefix(type_line)
-    t = re.sub(r"\s+", " ", t)
+    thickness=parts[0]
+    tint=""; glass_type=""
 
-    # normalize CLT/CLA spacing
-    t = re.sub(r"C\s*L\s*T", "CLT", t)
-    t = re.sub(r"C\s*L\s*A", "CLA", t)
-
-    parts = t.split()
-
-    # thickness = first part
-    thickness = parts[0] if parts else ""
-
-    # tint = last part matching suffix dictionary
-    tint = ""
     for p in parts:
-        up = p.upper()
-        best = up
-        best_score = -1
+        up=p.upper()
+        best=up; best_score=-1
         for suf in VALID_SUFFIXES:
-            sc = similarity(up, suf)
-            if sc > best_score:
-                best_score = sc
-                best = suf
-        if best_score >= 2:
-            tint = best
+            sc=similarity(up,suf)
+            if sc>best_score: best_score=sc; best=suf
+        if best_score>=2: tint=best
 
-    # type = everything between thickness and tint
-    glass_type = ""
-    if thickness and tint:
-        mid = t.replace(thickness, "", 1).replace(tint, "", 1).strip()
-        glass_type = mid
+    if tint:
+        mid = tline.replace(thickness,"",1).replace(tint,"",1).strip()
+        glass_type = re.sub(r"\s+"," ",mid)
 
     return thickness, glass_type, tint
 
-
 # ==========================================================
-# SIZE EXTRACTION (whole, fraction, mixed, inferred)
+# SIZE EXTRACTION (FIRST VALID AFTER TYPE)
 # ==========================================================
-def extract_size(raw):
-    text = raw.replace("\n", " ")
-    text = re.sub(r"\s+", " ", text)
+def is_valid_size_line(l):
+    if l.count("x")==0 and l.count("X")==0: return False
+    for pat in SIZE_REJECT_PATTERNS:
+        if re.search(pat,l): return False
+    if ":" in l: return False
+    return True
 
-    # 1) Fraction / Fraction
-    m = re.search(r"(\d{1,4}\s*\d+\/\d+)[xX ]+(\d{1,4}\s*\d+\/\d+)", text)
-    if m:
-        return f"{m.group(1).strip()} x {m.group(2).strip()}"
-
-    # 2) Fraction / Whole
-    m = re.search(r"(\d{1,4}\s*\d+\/\d+)[xX ]+(\d{1,4})\b", text)
-    if m:
-        return f"{m.group(1).strip()} x {m.group(2).strip()}"
-
-    # 3) Whole / Fraction
-    m = re.search(r"(\d{1,4})[xX ]+(\d{1,4}\s*\d+\/\d+)", text)
-    if m:
-        return f"{m.group(1).strip()} x {m.group(2).strip()}"
-
-    # 4) Whole / Whole
-    m = re.search(r"(\d{1,4})\s*[xX]\s*(\d{1,4})", text)
-    if m:
-        return f"{m.group(1).strip()} x {m.group(2).strip()}"
-
-    # 5) Missing "x": infer two numbers
-    m = re.search(r"\b(\d{1,4})\s+(\d{1,4})\b", text)
-    if m:
-        return f"{m.group(1)} x {m.group(2)}"
-
+def clean_size(s):
+    s=re.sub(r"[^0-9xX/ ]"," ",s)
+    s=re.sub(r"\s+"," ",s).strip()
+    s=s.replace("X","x")
+    # keep only W x H pattern
+    m=re.search(r"(\d{1,4}(?:\s*\d+/\d+)?)[ ]*x[ ]*(\d{1,4}(?:\s*\d+/\d+)?)",s)
+    if m: return f"{m.group(1).strip()} x {m.group(2).strip()}"
     return ""
 
+def extract_size(raw):
+    lines=[l.strip() for l in raw.split("\n") if l.strip()]
+
+    # find Cut> line
+    ci=None
+    for i,l in enumerate(lines):
+        if "cut>" in l.lower():
+            ci=i;break
+    if ci is None: return ""
+
+    # scan lines after type line for valid size
+    for j in range(ci+2,len(lines)):
+        l=lines[j]
+        if is_valid_size_line(l):
+            out=clean_size(l)
+            if out: return out
+
+    # fallback: infer two numbers
+    text=" ".join(lines)
+    m=re.search(r"\b(\d{1,4})\s+(\d{1,4})\b",text)
+    if m: return f"{m.group(1)} x {m.group(2)}"
+    return ""
 
 # ==========================================================
-# TAG
+# TAG & PO
 # ==========================================================
 def extract_tag(raw):
-    m = re.search(r"\b\d{6}(?:[-.,]\d+)?\b", raw)
+    m=re.search(r"\b\d{6}(?:[-.,]\d+)?\b",raw)
     return m.group(0) if m else ""
 
-
-# ==========================================================
-# PO
-# ==========================================================
 def extract_po(raw):
-    m = re.findall(r"\b\d{3,6}-\d{3}\b", raw)
+    m=re.findall(r"\b\d{3,6}-\d{3}\b",raw)
     return m[0] if m else ""
-
 
 # ==========================================================
 # EMAIL (BACKGROUND)
 # ==========================================================
 def send_email(csv_bytes, images):
-    msg = EmailMessage()
-    msg["From"] = f"{FROM_NAME} <{EMAIL_USER}>"
-    msg["To"] = TO_EMAILS
-    if CC_EMAILS:
-        msg["Cc"] = CC_EMAILS
-    msg["Subject"] = f"Glass Damage Report – {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-
+    msg=EmailMessage()
+    msg["From"]=f"{FROM_NAME} <{EMAIL_USER}>"
+    msg["To"]=TO_EMAILS
+    if CC_EMAILS: msg["Cc"]=CC_EMAILS
+    msg["Subject"]=f"Glass Damage Report – {datetime.now():%Y-%m-%d %H:%M}"
     msg.set_content("Batch submitted. Please review attachments.")
 
-    msg.add_attachment(
-        csv_bytes,
-        maintype="text",
-        subtype="csv",
-        filename="glass_report.csv"
-    )
+    msg.add_attachment(csv_bytes, maintype="text", subtype="csv", filename="glass_report.csv")
+    for i,img in enumerate(images):
+        msg.add_attachment(img, maintype="image", subtype="jpeg", filename=f"label_{i+1}.jpg")
 
-    for i, img in enumerate(images):
-        msg.add_attachment(
-            img,
-            maintype="image",
-            subtype="jpeg",
-            filename=f"label_{i+1}.jpg"
-        )
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-        smtp.login(EMAIL_USER, EMAIL_PASS)
+    with smtplib.SMTP_SSL("smtp.gmail.com",465) as smtp:
+        smtp.login(EMAIL_USER,EMAIL_PASS)
         smtp.send_message(msg)
-
 
 # ==========================================================
 # BACKGROUND QUEUE
 # ==========================================================
 def process_queue():
     if st.session_state.task_queue:
-        task = st.session_state.task_queue.pop(0)
-        send_email(task["csv_bytes"], task["images"])
-
+        job=st.session_state.task_queue.pop(0)
+        send_email(job["csv_bytes"], job["images"])
 
 # ==========================================================
-# UI — MULTI PHOTO
+# UI
 # ==========================================================
-st.title("KV Glass Damage Reporter (Multi-photo Background Send)")
+st.title("KV Glass Damage Reporter 📸") 
 
-mode = st.radio("Choose method:", ["Take Photo", "Upload Photos"])
+mode=st.radio("Mode:",["Take Photo","Upload Photos"])
 
-# --- Camera
-if mode == "Take Photo":
-    cam = st.camera_input("Capture")
+if mode=="Take Photo":
+    cam=st.camera_input("Capture")
     if cam:
-        img = cam.getvalue()
-        key = hashlib.sha256(img).hexdigest()
+        img=cam.getvalue()
+        key=hashlib.sha256(img).hexdigest()
         if key not in st.session_state.added_keys:
-            st.session_state.batch.append({"img": img, "key": key, "qty": "", "reason": ""})
+            st.session_state.batch.append({"img":img,"key":key,"qty":"","reason":""})
             st.session_state.added_keys.add(key)
 
-# --- Upload
-if mode == "Upload Photos":
-    files = st.file_uploader("Upload", type=["jpg","jpeg","png"], accept_multiple_files=True)
+if mode=="Upload Photos":
+    files=st.file_uploader("Upload",type=["jpg","jpeg","png"],accept_multiple_files=True)
     if files:
         for f in files:
-            img = f.read()
-            key = hashlib.sha256(img).hexdigest()
+            img=f.read()
+            key=hashlib.sha256(img).hexdigest()
             if key not in st.session_state.added_keys:
-                st.session_state.batch.append({"img": img, "key": key, "qty": "", "reason": ""})
+                st.session_state.batch.append({"img":img,"key":key,"qty":"","reason":""})
                 st.session_state.added_keys.add(key)
 
-# ==========================================================
-# SHOW BATCH
-# ==========================================================
-st.subheader("Photos Added")
+st.subheader("Photos Added:")
 
 if not st.session_state.batch:
-    st.info("No photos added.")
+    st.info("No photos yet.")
 else:
-    remove_list = []
-
-    for i, entry in enumerate(st.session_state.batch):
+    rm=[]
+    for i,e in enumerate(st.session_state.batch):
         st.write(f"### Photo {i+1}")
-        st.image(entry["img"])
+        st.image(e["img"])
+        e["qty"]=st.text_input(f"Qty ({i+1})",e["qty"],key=f"qty{i}")
+        e["reason"]=st.radio(f"Reason ({i+1})",
+            ["Scratched","Missing","Broken","KV Production Issue"],
+            key=f"reason{i}")
+        if st.button(f"Remove {i+1}",key=f"rm{i}"): rm.append(i)
 
-        entry["qty"] = st.text_input(f"Qty (Photo {i+1})", entry["qty"], key=f"qty{i}")
+    for i in sorted(rm,reverse=True):
+        st.session_state.added_keys.remove(st.session_state.batch[i]["key"])
+        del st.session_state.batch[i]
 
-        entry["reason"] = st.radio(
-            f"Reason (Photo {i+1})",
-            ["Scratched", "Missing", "Broken", "KV Production Issue"],
-            key=f"reason{i}"
-        )
-
-        if st.button(f"Remove Photo {i+1}", key=f"rm{i}"):
-            remove_list.append(i)
-
-    for idx in sorted(remove_list, reverse=True):
-        st.session_state.added_keys.remove(st.session_state.batch[idx]["key"])
-        del st.session_state.batch[idx]
-
-
-# ==========================================================
-# SEND BATCH
-# ==========================================================
 if st.session_state.batch:
     if st.button("Send Batch"):
-        rows = []
-        images = []
-        buf = io.StringIO()
-        writer = csv.writer(buf)
-
+        images=[]; buf=io.StringIO()
+        writer=csv.writer(buf)
         writer.writerow(["index","Thickness","Type","Tint","Size","Tag#","PO#","Qty","Reason"])
 
-        for i, entry in enumerate(st.session_state.batch, start=1):
-            img_bytes = entry["img"]
-            images.append(img_bytes)
+        for i,e in enumerate(st.session_state.batch,start=1):
+            img=e["img"]
+            images.append(img)
+            raw=ocr_raw(preprocess(img))
 
-            raw = ocr_raw(preprocess(img_bytes))
+            thickness,glass_type,tint=extract_type_components(raw)
+            size=extract_size(raw)
+            tag=extract_tag(raw)
+            po=extract_po(raw)
+            qty=e["qty"]
+            reason=e["reason"]
 
-            thickness, glass_type, tint = extract_type_components(raw)
-            size = extract_size(raw)
-            tag = extract_tag(raw)
-            po = extract_po(raw)
-            qty = entry["qty"]
-            reason = entry["reason"]
+            writer.writerow([i,thickness,glass_type,tint,size,tag,po,qty,reason])
 
-            writer.writerow([i, thickness, glass_type, tint, size, tag, po, qty, reason])
+        csv_bytes=buf.getvalue().encode()
+        st.session_state.task_queue.append({"csv_bytes":csv_bytes,"images":images})
 
-        csv_bytes = buf.getvalue().encode()
-
-        # queue the background task
-        st.session_state.task_queue.append({
-            "csv_bytes": csv_bytes,
-            "images": images
-        })
-
-        # clear UI
-        st.session_state.batch = []
-        st.session_state.added_keys = set()
-
+        st.session_state.added_keys=set()
+        st.session_state.batch=[]
         st.success("Batch submitted!")
 
 process_queue()
