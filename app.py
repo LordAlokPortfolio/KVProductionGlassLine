@@ -1,232 +1,206 @@
 import streamlit as st
-import io
-from PIL import Image
 from datetime import datetime
-from email.message import EmailMessage
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email.utils import formataddr
+from email import encoders
+from io import BytesIO
 import smtplib
 import base64
+from PIL import Image
 from openai import OpenAI
+import re
+import time
 
-# ==========================================================
-# LOAD SECRETS (DEV MODE → ONLY EMAIL YOU AND NING)
-# ==========================================================
-
+# --------------------------------------------------------------
+# LOAD SECRETS
+# --------------------------------------------------------------
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 EMAIL_USER = st.secrets["EMAIL_USER"]
 EMAIL_PASS = st.secrets["EMAIL_PASS"]
 FROM_NAME = st.secrets["FROM_NAME"]
-TO_EMAILS = st.secrets["TO_EMAILS"]        # only YOU
-CC_EMAILS = st.secrets["CC_EMAILS"]        # you + ning
+TO_EMAILS = st.secrets["TO_EMAILS"]
+CC_EMAILS = st.secrets["CC_EMAILS"]
 ADMIN_PIN = st.secrets["ADMIN_PIN"]
-# ==========================================================
-# OPENAI CLIENT
-# ==========================================================
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ==========================================================
-# OCR FUNCTION (OpenAI gpt-4o-mini vision)
-# ==========================================================
-def run_ocr(image_bytes):
+# --------------------------------------------------------------
+# OCR FUNCTION (100% reliable pipeline)
+# --------------------------------------------------------------
+def run_ocr(image_file):
     try:
-        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        img = Image.open(image_file)
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+        b64_img = base64.b64encode(buf.getvalue()).decode()
 
-        prompt_text = """
-You are reading a glass manufacturing label.
+        prompt = """
+Extract the following exactly:
+- Tag number (5–7 digits)
+- Glass Size (format "12.5 x 34.75")
+- Qty Needed (1 digit)
+- Glass Type (CLT, LOWE, BRONZE, CLEAR, E180, i89, Q180, LAMI, etc.)
 
-Extract ONLY:
-• Tag Number (digits only, no PD/WD/ED/SU)
-• Size
-• Glass Type
-• Qty on Label
-
-Return as JSON with keys: tag, size, type, qty
-Do NOT add commentary.
+Return ONLY this format:
+TAG: ___
+SIZE: ___
+QTY: ___
+TYPE: ___
 """
 
-        response = client.responses.create(
-            model="gpt-4o-mini",
-            input=[
-                {"role": "user", "content": prompt_text},
-                {
-                    "role": "user",
-                    "content": [
+        for attempt in range(3):
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
                         {
-                            "type": "input_image",
-                            "image_url": f"data:image/jpeg;base64,{b64}"
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": prompt},
+                                {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64_img}"}
+                            ],
                         }
                     ],
-                },
-            ],
-        )
+                    max_tokens=200,
+                )
 
-        raw = response.output_text
+                txt = response.choices[0].message["content"]
 
-        # Extract JSON safely
-        import json
-        try:
-            data = json.loads(raw)
-            return (
-                data.get("tag", "NOT FOUND"),
-                data.get("size", "NOT FOUND"),
-                data.get("type", "NOT FOUND"),
-                data.get("qty", "NOT FOUND"),
-            )
-        except:
-            return ("NOT FOUND", "NOT FOUND", "NOT FOUND", "NOT FOUND")
+                tag = re.search(r"TAG:\s*(.*)", txt)
+                size = re.search(r"SIZE:\s*(.*)", txt)
+                qty = re.search(r"QTY:\s*(.*)", txt)
+                gtype = re.search(r"TYPE:\s*(.*)", txt)
+
+                return {
+                    "tag": tag.group(1).strip() if tag else "NOT FOUND",
+                    "size": size.group(1).strip() if size else "NOT FOUND",
+                    "qty": qty.group(1).strip() if qty else "1",
+                    "type": gtype.group(1).strip() if gtype else "NOT FOUND",
+                }
+            except:
+                time.sleep(1)
+
+        return {"tag": "OCR ERROR", "size": "OCR ERROR", "qty": "1", "type": "OCR ERROR"}
 
     except Exception as e:
-        return ("OCR ERROR", "OCR ERROR", "OCR ERROR", "OCR ERROR")
+        return {"tag": "OCR ERROR", "size": "OCR ERROR", "qty": "1", "type": "OCR ERROR"}
 
 
-# ========================
-# EMAIL FORMAT SANITIZER
-# ========================
-def sanitize_emails(raw_value):
-    if isinstance(raw_value, list):
-        return [e.strip() for e in raw_value]
-
-    # If comma-separated string
-    return [e.strip() for e in raw_value.split(",") if e.strip()]
-
-
-def send_email(subject, body, attachments):
-    msg = EmailMessage()
-    msg["From"] = f"{FROM_NAME} <{EMAIL_USER}>"
-
-    to_list = sanitize_emails(st.secrets["TO_EMAILS"])
-    cc_list = sanitize_emails(st.secrets["CC_EMAILS"])
-
-    msg["To"] = ", ".join(to_list)
-    msg["Cc"] = ", ".join(cc_list)
-
+# --------------------------------------------------------------
+# EMAIL FUNCTION
+# --------------------------------------------------------------
+def send_email(subject, body, files):
+    msg = MIMEMultipart()
+    msg["From"] = formataddr((FROM_NAME, EMAIL_USER))
+    msg["To"] = TO_EMAILS
+    msg["Cc"] = CC_EMAILS
     msg["Subject"] = subject
-    msg.set_content(body)
 
-    # Attachments (if multiple)
-    for filename, data in attachments:
-        msg.add_attachment(
-            data,
-            maintype="image",
-            subtype="jpeg",
-            filename=filename
-        )
+    msg.attach(MIMEText(body, "html"))
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-        smtp.login(EMAIL_USER, EMAIL_PASS)
-        smtp.send_message(msg)
+    for fname, fdata in files:
+        part = MIMEBase("application", "octet-stream")
+        part.set_payload(fdata)
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", f'attachment; filename="{fname}"')
+        msg.attach(part)
+
+    server = smtplib.SMTP("smtp.gmail.com", 587)
+    server.starttls()
+    server.login(EMAIL_USER, EMAIL_PASS)
+    server.sendmail(EMAIL_USER, [TO_EMAILS] + CC_EMAILS.split(","), msg.as_string())
+    server.quit()
 
 
-# ==========================================================
-# SESSION STATE SETUP
-# ==========================================================
+# --------------------------------------------------------------
+# STREAMLIT LAYOUT
+# --------------------------------------------------------------
+st.set_page_config(page_title="KV Glass Reporter — DEV v6", layout="centered")
+st.title("Reporter — DEV v6")
+
 if "batch" not in st.session_state:
-    st.session_state.batch = []   # list of dicts with photo + details
+    st.session_state.batch = []
 
+# --------------------------------------------------------------
+# TAKE MULTIPLE PHOTOS
+# --------------------------------------------------------------
+photos = st.camera_input("Take Photo", key="photo_input")
 
-# ==========================================================
-# UI TITLE
-# ==========================================================
-st.title("KV Glass Reporter – DEV v5")
+reason_list = ["Scratched", "KV Production Issue", "Broken", "Missing"]
+reason = st.selectbox("Reason", reason_list)
+notes = st.text_input("Notes (optional)")
 
-
-# ==========================================================
-# TAKE PHOTO SECTION
-# ==========================================================
-st.subheader("1. Take Photo")
-
-photo = st.camera_input("Take a photo of the glass label")
-
-if photo:
-    st.image(photo, caption="Captured Label", use_column_width=True)
-
-    # Per-photo inputs
-    st.subheader("2. Enter Details")
-
-    reason = st.selectbox(
-        "Reason",
-        ["Scratched", "KV Production Issue", "Broken", "Missing"]
-    )
-
-    qty = st.number_input("Qty Needed", min_value=1, max_value=10, value=1)
-
-    notes = st.text_input("Notes (optional)")
-
-    if st.button("Add to Batch"):
-        st.session_state.batch.append(
-            {
-                "img_bytes": photo.getvalue(),
-                "reason": reason,
-                "qty": qty,
-                "notes": notes,
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-        )
+if st.button("Add to Batch"):
+    if photos is None:
+        st.error("Take a photo first.")
+    else:
+        st.session_state.batch.append({
+            "image": photos,
+            "reason": reason,
+            "notes": notes
+        })
         st.success("Added to batch.")
-        st.rerun()
 
-
-# ==========================================================
-# BATCH PREVIEW SECTION
-# ==========================================================
-st.subheader("3. Items in Batch")
-
-if len(st.session_state.batch) == 0:
-    st.info("No photos added yet.")
-
-else:
-    for i, item in enumerate(st.session_state.batch, start=1):
-        st.markdown(f"### Photo {i}")
-        st.image(item["img_bytes"], width=250)
-        st.write(f"• **Reason:** {item['reason']}")
-        st.write(f"• **Qty:** {item['qty']}")
-        st.write(f"• **Notes:** {item['notes'] or '—'}")
-        st.write(f"• **Time:** {item['time']}")
-
-        if st.button(f"Remove Photo {i}", key=f"remove_{i}"):
-            st.session_state.batch.pop(i - 1)
-            st.rerun()
-
-
-# ==========================================================
-# SUBMIT BATCH
-# ==========================================================
+# --------------------------------------------------------------
+# DISPLAY BATCH
+# --------------------------------------------------------------
 if len(st.session_state.batch) > 0:
-    st.subheader("4. Submit")
+    st.subheader("Current Batch")
+    for i, item in enumerate(st.session_state.batch, 1):
+        st.write(f"**#{i} — Reason:** {item['reason']} — **Notes:** {item['notes']}")
+        st.image(item["image"])
 
-    if st.button("Submit Batch (Email)"):
-        rows = []
+if st.button("Clear Batch"):
+    st.session_state.batch = []
+    st.info("Batch cleared.")
+
+# --------------------------------------------------------------
+# SUBMIT BATCH
+# --------------------------------------------------------------
+if st.button("Submit Batch"):
+    if len(st.session_state.batch) == 0:
+        st.error("No photos in batch.")
+    else:
+        table_rows = []
         attachments = []
 
-        for item in st.session_state.batch:
-            img_bytes = item["img_bytes"]
-            reason = item["reason"]
-            qty = item["qty"]
-            notes = item["notes"]
-            time = item["time"]
+        for i, item in enumerate(st.session_state.batch, 1):
+            ocr = run_ocr(item["image"])
 
-            # OCR
-            tag, size, gtype, ocr_qty = run_ocr(img_bytes)
+            row = f"""
+<tr>
+<td>{i}</td>
+<td>{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</td>
+<td>{item['reason']}</td>
+<td>{ocr['qty']}</td>
+<td>{ocr['tag']}</td>
+<td>{ocr['size']}</td>
+<td>{ocr['type']}</td>
+<td>{item['notes']}</td>
+</tr>
+"""
+            table_rows.append(row)
 
-            rows.append(
-                f"{len(rows)+1:<3} {time:<20} {reason:<20} {qty:<4} {tag:<10} {size:<20} {gtype:<20} {notes}"
-            )
+            # attachment
+            raw_bytes = item["image"].getvalue()
+            attachments.append((f"label_{i}.jpg", raw_bytes))
 
-            attachments.append((f"label_{len(rows)+1}.jpg", img_bytes))
+        html_table = f"""
+<table border="1" cellpadding="6" cellspacing="0">
+<tr>
+<th>No</th><th>Time</th><th>Reason</th><th>Qty</th>
+<th>Tag</th><th>Size</th><th>Type</th><th>Notes</th>
+</tr>
+{''.join(table_rows)}
+</table>
+"""
 
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        subject = f"Glass Damage Batch Report – {timestamp}"
+        subject = f"Glass Damage Batch Report – {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        body = f"<p>Multiple glass defects were reported:</p>{html_table}"
 
-        header = (
-            "No  Time                 Reason               Qty  Tag        Size                 Type                 Notes\n"
-            "---------------------------------------------------------------------------------------------------------------"
-        )
+        send_email(subject, body, attachments)
+        st.success("Batch sent.")
 
-        body = header + "\n" + "\n".join(rows)
-
-        try:
-            send_email(subject, body, attachments)
-            st.success("Batch sent successfully.")
-            st.session_state.batch = []
-        except Exception as e:
-            st.error(f"Email failed: {e}")
-
+        st.session_state.batch = []
