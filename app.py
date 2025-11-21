@@ -8,6 +8,7 @@ from PIL import Image, ImageEnhance, ImageOps
 import io
 import re
 import csv
+import hashlib
 
 # =====================================================================
 # LOAD SECRETS
@@ -22,22 +23,26 @@ OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =====================================================================
-# VALID SUFFIXES (USED ONLY FOR FIXING OCR SUFFIX TYPOS)
+# VALID SUFFIXES FOR CORRECTING OCR SUFFIX ONLY
 # =====================================================================
 VALID_SUFFIXES = [
     "T", "E180ESC", "Q180", "E272", "Q272",
     "E366", "Q366", "EI89", "QI89",
-    "NREEDV", "MATT", "GRY", "P621", "BRZ"
+    "NREEDV", "MATT", "GRY", "P621", "BRZ", "MATTFROST"
 ]
 
 # =====================================================================
-# INITIALIZE BATCH STORAGE
+# SESSION STATE INITIALIZATION
 # =====================================================================
 if "batch" not in st.session_state:
-    st.session_state.batch = []   # Each item: {img, qty, reason, notes}
+    st.session_state.batch = []   # list of entries: {img, img_key, qty, reason}
+
+if "added_keys" not in st.session_state:
+    st.session_state.added_keys = set()   # track hashes to prevent duplicates
+
 
 # =====================================================================
-# IMAGE PREPROCESSING (improves OCR accuracy)
+# IMAGE PREPROCESSING
 # =====================================================================
 def preprocess(img_bytes):
     img = Image.open(io.BytesIO(img_bytes))
@@ -49,7 +54,7 @@ def preprocess(img_bytes):
     return buf.getvalue()
 
 # =====================================================================
-# OCR RAW TEXT WITH GPT-4O-MINI
+# OCR RAW TEXT (GPT-4O-MINI)
 # =====================================================================
 def ocr_raw(img_bytes):
     b64 = base64.b64encode(img_bytes).decode()
@@ -60,7 +65,7 @@ def ocr_raw(img_bytes):
                 {
                     "role": "user",
                     "content": [
-                        {"type": "input_text", "text": "Extract raw text only. No explanations."},
+                        {"type": "input_text", "text": "Extract raw text only. No explanation."},
                         {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"}
                     ]
                 }
@@ -71,7 +76,7 @@ def ocr_raw(img_bytes):
         return f"OCR_ERROR: {e}"
 
 # =====================================================================
-# PREFIX REPAIR (fixes 39 → 3.9, 3 9 → 3.9, 3-9 → 3.9, etc.)
+# PREFIX REPAIR
 # =====================================================================
 def repair_prefix(text):
     patterns = {
@@ -103,14 +108,14 @@ def similarity(a, b):
     return sum(1 for x, y in zip(a, b) if x == y)
 
 # =====================================================================
-# TYPE EXTRACTION (EXACT ORDER PRESERVED)
+# TYPE EXTRACTION (NO ORDER CHANGE)
 # =====================================================================
 def extract_type(raw):
     raw = raw.replace("\n", " ")
     raw = repair_prefix(raw)
     raw = re.sub(r"\s+", " ", raw)
 
-    raw = re.sub(r"C\s*L\s*T", "CLT", raw)  # Normalize CLT spacing
+    raw = re.sub(r"C\s*L\s*T", "CLT", raw)  # Normalize CLT formatting
 
     prefix_pat = r"(3\.1|3\.9|4\.7|5\.7)[^\n]+"
     m = re.search(prefix_pat, raw)
@@ -118,8 +123,8 @@ def extract_type(raw):
         return ""
 
     line = m.group(0).strip()
-
     parts = line.split()
+
     if len(parts) == 1:
         return parts[0]
 
@@ -129,17 +134,13 @@ def extract_type(raw):
 
         best = raw_p
         best_score = -1
-
         for suf in VALID_SUFFIXES:
             s = similarity(raw_p, suf)
             if s > best_score:
                 best_score = s
                 best = suf
 
-        if best_score >= 2:
-            corrected.append(best)
-        else:
-            corrected.append(p)
+        corrected.append(best if best_score >= 2 else p)
 
     return " ".join(corrected).strip()
 
@@ -171,7 +172,7 @@ def extract_po(raw):
 # =====================================================================
 # EMAIL SENDER
 # =====================================================================
-def send_email(table_string, csv_bytes, image_list):
+def send_email(table_string, csv_bytes, images):
     msg = EmailMessage()
     msg["From"] = f"{FROM_NAME} <{EMAIL_USER}>"
     msg["To"] = TO_EMAILS
@@ -182,73 +183,95 @@ def send_email(table_string, csv_bytes, image_list):
 
     msg.add_attachment(csv_bytes, maintype="text", subtype="csv", filename="glass_report.csv")
 
-    for i, img_bytes in enumerate(image_list):
-        msg.add_attachment(img_bytes, maintype="image", subtype="jpeg", filename=f"label_{i+1}.jpg")
+    for i, img_bytes in enumerate(images):
+        msg.add_attachment(
+            img_bytes,
+            maintype="image",
+            subtype="jpeg",
+            filename=f"label_{i+1}.jpg"
+        )
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(EMAIL_USER, EMAIL_PASS)
         smtp.send_message(msg)
 
 # =====================================================================
-# UI — SINGLE PAGE MULTI-PHOTO BATCH
+# UI — MULTI-PHOTO
 # =====================================================================
-st.title("KV Glass Damage Reporter (Multi-Photo)")
+st.title("KV Glass Damage Reporter (Multi-photo, No Duplicates)")
 
-mode = st.radio("Choose Method:", ["Take Photo", "Upload Photo"])
+mode = st.radio("Choose Method:", ["Take Photo", "Upload Photos"])
 
+# =========== CAMERA MODE ================
 if mode == "Take Photo":
     cam = st.camera_input("Capture Photo")
     if cam:
-        st.session_state.batch.append({
-            "img": cam.getvalue(),
-            "qty": "",
-            "reason": ""
-        })
+        img_bytes = cam.getvalue()
+        img_key = hashlib.sha256(img_bytes).hexdigest()
 
-if mode == "Upload Photo":
-    files = st.file_uploader("Upload Photos", type=["jpg","jpeg","png"], accept_multiple_files=True)
-    if files:
-        for f in files:
+        if img_key not in st.session_state.added_keys:
             st.session_state.batch.append({
-                "img": f.read(),
+                "img": img_bytes,
+                "img_key": img_key,
                 "qty": "",
                 "reason": ""
             })
+            st.session_state.added_keys.add(img_key)
+
+# =========== UPLOAD MODE =================
+if mode == "Upload Photos":
+    files = st.file_uploader("Upload Images", type=["jpg","jpeg","png"], accept_multiple_files=True)
+    if files:
+        for f in files:
+            img_bytes = f.read()
+            img_key = hashlib.sha256(img_bytes).hexdigest()
+
+            if img_key not in st.session_state.added_keys:
+                st.session_state.batch.append({
+                    "img": img_bytes,
+                    "img_key": img_key,
+                    "qty": "",
+                    "reason": ""
+                })
+                st.session_state.added_keys.add(img_key)
 
 # =====================================================================
-# SHOW BATCH
+# SHOW BATCH & PER-PHOTO INPUTS
 # =====================================================================
 st.subheader("Photos Added")
 
 if len(st.session_state.batch) == 0:
-    st.info("No photos added yet.")
+    st.info("No photos added.")
 else:
-    remove_indices = []
+    remove_list = []
 
     for i, entry in enumerate(st.session_state.batch):
         st.write(f"### Photo {i+1}")
         st.image(entry["img"], use_column_width=True)
 
-        entry["qty"] = st.text_input(f"Qty for Photo {i+1}", value=entry["qty"] or "", key=f"qty{i}")
-        entry["reason"] = st.text_input(f"Reason for Photo {i+1}", value=entry["reason"] or "", key=f"reason{i}")
+        entry["qty"] = st.text_input(f"Qty for Photo {i+1}", entry["qty"], key=f"qty{i}")
+        entry["reason"] = st.text_input(f"Reason for Photo {i+1}", entry["reason"], key=f"reason{i}")
 
         if st.button(f"Remove Photo {i+1}", key=f"remove{i}"):
-            remove_indices.append(i)
+            remove_list.append(i)
 
-    for idx in sorted(remove_indices, reverse=True):
-        del st.session_state.batch[idx]
+    # Remove photos & remove keys
+    for i in sorted(remove_list, reverse=True):
+        key = st.session_state.batch[i]["img_key"]
+        if key in st.session_state.added_keys:
+            st.session_state.added_keys.remove(key)
+        del st.session_state.batch[i]
 
 # =====================================================================
-# PROCESS AND SEND ALL
+# PROCESS ALL
 # =====================================================================
 if len(st.session_state.batch) > 0:
     if st.button("Process & Send All"):
-        with st.spinner("Processing all photos…"):
+        with st.spinner("Processing..."):
 
             rows = []
-            csv_buffer = io.StringIO()
-            csv_writer = csv.writer(csv_buffer)
-
+            csv_buf = io.StringIO()
+            csv_writer = csv.writer(csv_buf)
             csv_writer.writerow(["index", "Size", "Type", "Tag#", "PO#", "Qty", "Reason"])
 
             images = []
@@ -263,18 +286,24 @@ if len(st.session_state.batch) > 0:
                 gtype = extract_type(raw)
                 tag = extract_tag(raw)
                 po = extract_po(raw)
+
                 qty = entry["qty"]
                 reason = entry["reason"]
 
                 rows.append(f"{i} | {size} | {gtype} | {tag} | {po} | {qty} | {reason}")
                 csv_writer.writerow([i, size, gtype, tag, po, qty, reason])
 
-            table_string = "index | Size | Type | Tag# | PO# | Qty | Reason\n" + "\n".join(rows)
+            table_string = (
+                "index | Size | Type | Tag# | PO# | Qty | Reason\n" +
+                "\n".join(rows)
+            )
 
-            csv_bytes = csv_buffer.getvalue().encode()
+            csv_bytes = csv_buf.getvalue().encode()
 
             send_email(table_string, csv_bytes, images)
 
-            st.success("All photos processed & email sent!")
+            st.success("Email sent successfully!")
 
+            # CLEAR BATCH
             st.session_state.batch = []
+            st.session_state.added_keys = set()
