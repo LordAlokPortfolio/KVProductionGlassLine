@@ -50,41 +50,43 @@ QTY: ___
 TYPE: ___
 """
 
-        for attempt in range(3):
-            try:
-                response = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                },
+                {
+                    "role": "user",
+                    "content": [
                         {
-                            "role": "user",
-                            "content": [
-                                {"type": "input_text", "text": prompt},
-                                {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64_img}"}
-                            ],
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{b64_img}"
+                            }
                         }
-                    ],
-                    max_tokens=200,
-                )
-
-                txt = response.choices[0].message["content"]
-
-                tag = re.search(r"TAG:\s*(.*)", txt)
-                size = re.search(r"SIZE:\s*(.*)", txt)
-                qty = re.search(r"QTY:\s*(.*)", txt)
-                gtype = re.search(r"TYPE:\s*(.*)", txt)
-
-                return {
-                    "tag": tag.group(1).strip() if tag else "NOT FOUND",
-                    "size": size.group(1).strip() if size else "NOT FOUND",
-                    "qty": qty.group(1).strip() if qty else "1",
-                    "type": gtype.group(1).strip() if gtype else "NOT FOUND",
+                    ]
                 }
-            except:
-                time.sleep(1)
+            ],
+            max_tokens=200,
+        )
 
-        return {"tag": "OCR ERROR", "size": "OCR ERROR", "qty": "1", "type": "OCR ERROR"}
+        txt = response.choices[0].message.content
 
-    except Exception as e:
+        tag = re.search(r"TAG:\s*(.*)", txt)
+        size = re.search(r"SIZE:\s*(.*)", txt)
+        qty = re.search(r"QTY:\s*(.*)", txt)
+        gtype = re.search(r"TYPE:\s*(.*)", txt)
+
+        return {
+            "tag": tag.group(1).strip() if tag else "NOT FOUND",
+            "size": size.group(1).strip() if size else "NOT FOUND",
+            "qty": qty.group(1).strip() if qty else "1",
+            "type": gtype.group(1).strip() if gtype else "NOT FOUND",
+        }
+
+    except:
         return {"tag": "OCR ERROR", "size": "OCR ERROR", "qty": "1", "type": "OCR ERROR"}
 
 
