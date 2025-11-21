@@ -22,7 +22,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # ==========================================================
 VALID_SUFFIXES = [
     "E180","E180ESC","Q180","E272","Q272",
-    "E366","Q366","EI89","QI89",
+    "E366","Q366","EI89","QI89","NREEDV1",
     "NREEDV","MATT","GRY","P621","BRZ"
 ]
 
