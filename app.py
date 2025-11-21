@@ -139,25 +139,23 @@ if "batch" not in st.session_state:
     st.session_state.batch = []
 
 
-# =====================================================================
-# PHOTO INPUT
-# =====================================================================
-uploaded_files = st.camera_input("Take Photo", key="camera", disabled=False)
+# ==============================
+# IMAGE UPLOAD (Gallery Only)
+# ==============================
+photo = st.file_uploader("Upload Label Photo (JPG/PNG)", type=["jpg", "jpeg", "png"])
 
-reason = st.selectbox("Reason", ["Scratched", "KV Production Issue", "Broken", "Missing"])
-notes = st.text_input("Notes (Optional)")
+if photo:
+    img_bytes = photo.read()
 
-if st.button("Add to Batch"):
-    if uploaded_files is None:
-        st.error("No photo taken.")
-    else:
-        st.session_state.batch.append({
-            "image": uploaded_files,
-            "reason": reason,
-            "notes": notes,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        })
-        st.success("Added to batch.")
+    # Debugger
+    st.write("DEBUG — IMAGE BYTES:", len(img_bytes))
+
+    if len(img_bytes) < 5000:
+        st.error("Image file seems empty or corrupted. Please upload again.")
+        st.stop()
+else:
+    img_bytes = None
+
 
 
 # =====================================================================
@@ -194,6 +192,12 @@ if st.button("Submit All Photos"):
         attachments = []
 
         for i, item in enumerate(st.session_state.batch, start=1):
+            if img_bytes is None:
+                st.error("No image uploaded.")
+                st.stop()
+            if len(img_bytes) < 5000:
+                st.error("Image file seems empty or corrupted. Please upload again.")
+                st.stop()
             ocr = run_ocr(item["image"])
 
             rows.append(f"""
