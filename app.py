@@ -1,256 +1,220 @@
 import streamlit as st
+import base64
+import time
+from datetime import datetime
+from email.message import EmailMessage
+import smtplib
 from openai import OpenAI
 from PIL import Image
-import base64
-from io import BytesIO
-import smtplib, ssl
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
-import re
-from datetime import datetime
+import io
 
 # =====================================================================
 # LOAD SECRETS
 # =====================================================================
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-
 EMAIL_USER = st.secrets["EMAIL_USER"]
 EMAIL_PASS = st.secrets["EMAIL_PASS"]
 FROM_NAME = st.secrets["FROM_NAME"]
 TO_EMAILS = st.secrets["TO_EMAILS"]
 CC_EMAILS = st.secrets["CC_EMAILS"]
 ADMIN_PIN = st.secrets["ADMIN_PIN"]
+OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 
-# DEBUG LINE
-st.write ("api KEY LOADED:", bool(st.secrets.get("OPENAI_API_KEY")))
+# OpenAI Client
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Convert comma-separated list → python list
-TO_LIST = [x.strip() for x in TO_EMAILS.split(",") if x.strip()]
-CC_LIST = [x.strip() for x in CC_EMAILS.split(",") if x.strip()]
-
+# =====================================================================
+# SESSION STATE (Batch Storage)
+# =====================================================================
+if "batch" not in st.session_state:
+    st.session_state.batch = []  # each entry = {img_bytes, reason, notes}
+if "camera_img" not in st.session_state:
+    st.session_state.camera_img = None
+if "gallery_imgs" not in st.session_state:
+    st.session_state.gallery_imgs = []
 
 # =====================================================================
 # EMAIL SENDER
 # =====================================================================
-def send_email(subject, body, attachments=None, to_list=None, cc_list=None):
-    if to_list is None:
-        to_list = []
-    if cc_list is None:
-        cc_list = []
-
-    msg = MIMEMultipart()
+def send_email(subject, body, attachments):
+    msg = EmailMessage()
     msg["From"] = f"{FROM_NAME} <{EMAIL_USER}>"
-    msg["To"] = ", ".join(to_list)
-    msg["Cc"] = ", ".join(cc_list)
+    msg["To"] = TO_EMAILS
+    if CC_EMAILS:
+        msg["Cc"] = CC_EMAILS
     msg["Subject"] = subject
+    msg.set_content(body)
 
-    msg.attach(MIMEText(body, "html"))
+    # Attach all images in batch
+    for idx, img_bytes in enumerate(attachments):
+        msg.add_attachment(
+            img_bytes,
+            maintype="image",
+            subtype="jpeg",
+            filename=f"label_{idx+1}.jpg"
+        )
 
-    if attachments:
-        for filename, file_bytes in attachments:
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(file_bytes)
-            encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f"attachment; filename={filename}")
-            msg.attach(part)
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context()) as server:
-        server.login(EMAIL_USER, EMAIL_PASS)
-        server.sendmail(EMAIL_USER, to_list + cc_list, msg.as_string())
-
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(EMAIL_USER, EMAIL_PASS)
+        smtp.send_message(msg)
 
 # =====================================================================
-# OPENAI OCR (FINAL, FIXED, WORKING)
+# OCR FUNCTION (OpenAI Vision)
 # =====================================================================
-def run_ocr(image_file):
+def run_ocr(img_bytes):
+    """
+    Sends raw JPEG bytes to OpenAI Vision OCR.
+    Returns raw extracted text.
+    """
     try:
-        # FIX: extract bytes correctly
-        if hasattr(image_file, "getvalue"):
-            raw = image_file.getvalue()
-        else:
-            raw = image_file.read()
-
-        img = Image.open(BytesIO(raw))
-        buf = BytesIO()
-        img.save(buf, format="JPEG", quality=90)
-        b64_img = base64.b64encode(buf.getvalue()).decode()
-
-        prompt = """
-Extract only these fields:
-
-TAG: (5–7 digit number)
-SIZE: (format: 12.5 x 34.75)
-QTY: (1 digit)
-TYPE: (CLT, LOWE, CLEAR, BRONZE, LAMI, E180, Q180, i89, etc.)
-
-FORMAT:
-TAG: xxx
-SIZE: xxx
-QTY: xxx
-TYPE: xxx
-"""
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "user", "content": prompt},
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}
-                        }
+                        {"type": "input_text", "text": "Extract ALL text. Do not interpret. Just raw OCR."},
+                        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"}
                     ]
                 }
             ],
-            max_tokens=200,
+            max_tokens=300
         )
 
-        txt = response.choices[0].message.content
+        return response.choices[0].message.content.strip()
 
-        return {
-            "tag": re.search(r"TAG:\s*(.*)", txt).group(1).strip() if re.search(r"TAG:", txt) else "OCR ERROR",
-            "size": re.search(r"SIZE:\s*(.*)", txt).group(1).strip() if re.search(r"SIZE:", txt) else "OCR ERROR",
-            "qty": re.search(r"QTY:\s*(.*)", txt).group(1).strip() if re.search(r"QTY:", txt) else "1",
-            "type": re.search(r"TYPE:\s*(.*)", txt).group(1).strip() if re.search(r"TYPE:", txt) else "OCR ERROR",
-        }
-
-    except Exception:
-        return {"tag": "OCR ERROR", "size": "OCR ERROR", "qty": "1", "type": "OCR ERROR"}
-
-
+    except Exception as e:
+        return f"OCR_ERROR: {e}"
 
 # =====================================================================
-# STREAMLIT PAGE CONFIG
+# IMAGE PREVIEW HELPER
 # =====================================================================
-st.set_page_config(page_title="Reporter – DEV v6", layout="centered")
-
-st.title("Reporter — DEV v6")
-st.write("Take up to **5 photos**, review them, then submit.")
-
+def show_image_preview(img_bytes, caption):
+    img = Image.open(io.BytesIO(img_bytes))
+    st.image(img, caption=caption, use_column_width=True)
 
 # =====================================================================
-# SESSION STATE: HOLDS BATCH
+# UI START
 # =====================================================================
-if "batch" not in st.session_state:
-    st.session_state.batch = []
+st.title("KV Glass Damage Reporter – Hybrid Camera + Gallery")
 
+tab1, tab2, tab3 = st.tabs(["Take Photo", "Upload Photo", "Batch & Submit"])
 
-# ====================================
-# MULTI-PHOTO GALLERY UPLOAD
-# ====================================
-photos = st.file_uploader(
-    "Upload one or more label photos (JPG/PNG)",
-    type=["jpg", "jpeg", "png"],
-    accept_multiple_files=True
-)
+# =====================================================================
+# TAB 1 — CAMERA
+# =====================================================================
+with tab1:
+    st.subheader("Take Photo")
 
-# Debug list to hold processed images
-uploaded_images = []
+    cam = st.camera_input("Capture Label")
 
-if photos:
-    for p in photos:
-        img_bytes = p.read()
-
-        # Debugger per-image
-        st.write(f"DEBUG – {p.name} – BYTES:", len(img_bytes))
-
+    if cam:
+        img_bytes = cam.getvalue()
         if len(img_bytes) < 5000:
-            st.error(f"{p.name} is corrupted or empty. Re-upload that image.")
-            st.stop()
+            st.error("Camera image is corrupted. Retake.")
+        else:
+            st.session_state.camera_img = img_bytes
+            show_image_preview(img_bytes, "Captured Image")
 
-        uploaded_images.append(img_bytes)
+            reason = st.selectbox(
+                "Reason for this glass",
+                ["Scratched", "Broken", "Missing", "KV Production Issue"]
+            )
+            notes = st.text_input("Notes (optional)")
 
-# If user clicks submit with no images
-if not photos:
-    uploaded_images = []
-
-
-
-
-# =====================================================================
-# DISPLAY CURRENT BATCH
-# =====================================================================
-st.subheader("Current Batch")
-
-if len(st.session_state.batch) == 0:
-    st.info("No photos added yet.")
-else:
-    for i, row in enumerate(st.session_state.batch, start=1):
-        st.write(f"### {i}. {row['time']}")
-        st.image(row["image"])
-        st.write(f"**Reason:** {row['reason']}")
-        st.write(f"**Notes:** {row['notes']}")
-
+            if st.button("Add to Batch (Camera Photo)"):
+                st.session_state.batch.append(
+                    {"img": img_bytes, "reason": reason, "notes": notes}
+                )
+                st.success("Added to batch.")
+                st.session_state.camera_img = None
 
 # =====================================================================
-# CLEAR
+# TAB 2 — GALLERY
 # =====================================================================
-if st.button("Clear All"):
-    st.session_state.batch = []
-    st.success("Batch cleared.")
+with tab2:
+    st.subheader("Upload from Gallery")
 
+    uploads = st.file_uploader(
+        "Select one or more images",
+        accept_multiple_files=True,
+        type=["jpg", "jpeg", "png"]
+    )
 
-# =====================================================================
-# SUBMIT BATCH (EMAIL)
-# =====================================================================
-if st.button("Submit All Photos"):
-    if len(st.session_state.batch) == 0:
-        st.error("Batch is empty.")
-    else:
-        rows = []
-        attachments = []
-
-        for i, item in enumerate(st.session_state.batch, start=1):
-            if img_bytes is None:
-                st.error("No image uploaded.")
-                st.stop()
+    if uploads:
+        for file in uploads:
+            img_bytes = file.read()
             if len(img_bytes) < 5000:
-                st.error("Image file seems empty or corrupted. Please upload again.")
-                st.stop()
-            ocr = run_ocr(item["image"])
+                st.error(f"{file.name} is corrupted. Skip.")
+                continue
 
-            rows.append(f"""
-<tr>
-<td>{i}</td>
-<td>{item['time']}</td>
-<td>{item['reason']}</td>
-<td>{ocr['qty']}</td>
-<td>{ocr['tag']}</td>
-<td>{ocr['size']}</td>
-<td>{ocr['type']}</td>
-<td>{item['notes']}</td>
-</tr>
-""")
+            show_image_preview(img_bytes, file.name)
 
-            # Add photo attachment
-            img_bytes = item["image"].getvalue()
-            attachments.append((f"label_{i}.jpg", img_bytes))
+            reason = st.selectbox(
+                f"Reason for {file.name}",
+                ["Scratched", "Broken", "Missing", "KV Production Issue"],
+                key=f"reason_{file.name}"
+            )
+            notes = st.text_input(
+                f"Notes for {file.name}",
+                key=f"notes_{file.name}"
+            )
 
-        table_html = f"""
-<table border="1" cellpadding="6" cellspacing="0">
-<tr>
-<th>No</th><th>Time</th><th>Reason</th><th>Qty</th><th>Tag</th>
-<th>Size</th><th>Type</th><th>Notes</th>
-</tr>
-{''.join(rows)}
-</table>
+            if st.button(f"Add {file.name} to Batch"):
+                st.session_state.batch.append(
+                    {"img": img_bytes, "reason": reason, "notes": notes}
+                )
+                st.success(f"{file.name} added to batch.")
+
+# =====================================================================
+# TAB 3 — BATCH & SUBMIT
+# =====================================================================
+with tab3:
+    st.subheader("Batch Review")
+
+    if len(st.session_state.batch) == 0:
+        st.info("No photos in batch yet.")
+    else:
+        for idx, entry in enumerate(st.session_state.batch):
+            st.write(f"### Photo {idx+1}")
+            show_image_preview(entry["img"], f"Reason: {entry['reason']} / Notes: {entry['notes']}")
+
+        # Perform OCR on submit
+        if st.button("Submit Batch"):
+            with st.spinner("Running OCR on all images..."):
+                ocr_outputs = []
+                for entry in st.session_state.batch:
+                    text = run_ocr(entry["img"])
+                    ocr_outputs.append(text)
+
+            # Build email body
+            email_body = "A glass damage report has been submitted.\n\n"
+            for idx, (entry, ocr_text) in enumerate(zip(st.session_state.batch, ocr_outputs)):
+                email_body += f"""
+==========================
+Photo {idx+1}
+==========================
+Reason: {entry['reason']}
+Notes: {entry['notes']}
+
+OCR Extracted Text:
+{ocr_text}
+
 """
 
-        body = f"""
-Multiple glass defects were reported:<br><br>
-{table_html}
-"""
+            subject = (
+                f"Glass Damage Batch Report – {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            )
 
-        subject = f"Glass Damage Batch Report – {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            # Send email
+            try:
+                attachments = [x["img"] for x in st.session_state.batch]
+                send_email(subject, email_body, attachments)
+                st.success("Email sent successfully.")
 
-        send_email(subject, body, attachments, TO_LIST, CC_LIST)
+                # Auto-clear batch
+                st.session_state.batch = []
 
-        st.success("Batch submitted.")
-        st.session_state.batch = []
-
-
-
+            except Exception as e:
+                st.error(f"Email failed: {e}")
