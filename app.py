@@ -1,24 +1,28 @@
 import streamlit as st
-import base64, hashlib, io, csv, re, smtplib
+import base64, hashlib, io, csv, re, smtplib, os
 from datetime import datetime
 from email.message import EmailMessage
 from openai import OpenAI
 import openai
 
-# TEMP CHECK
+# TEMP VERSION CHECK
 st.write("OpenAI SDK:", openai.__version__)
 
 # ==========================================================
-# SECRETS
+# SETUP OPENAI CLIENT (IMPORTANT: NO ARGUMENTS)
 # ==========================================================
-EMAIL_USER = st.secrets["EMAIL_USER"]
-EMAIL_PASS = st.secrets["EMAIL_PASS"]
-FROM_NAME  = st.secrets["FROM_NAME"]
-TO_EMAILS  = st.secrets["TO_EMAILS"]
-CC_EMAILS  = st.secrets.get("CC_EMAILS","")
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+client = OpenAI()
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# ==========================================================
+# EMAIL CONFIG
+# ==========================================================
+EMAIL_USER  = st.secrets["EMAIL_USER"]
+EMAIL_PASS  = st.secrets["EMAIL_PASS"]
+FROM_NAME   = st.secrets["FROM_NAME"]
+TO_EMAILS   = st.secrets["TO_EMAILS"]
+CC_EMAILS   = st.secrets.get("CC_EMAILS","")
 
 # ==========================================================
 # CONSTANTS
@@ -30,21 +34,21 @@ VALID_SUFFIXES = [
 ]
 
 SIZE_REJECT_PATTERNS = [
-    r"\b20\d{2}\b",      # years
-    r"\d{1,2}:\d{1,2}",  # codes like 29:1
-    r"WO:", r"WD-"       # work order
+    r"\b20\d{2}\b",      # Years
+    r"\d{1,2}:\d{1,2}",  # Colon codes
+    r"WO:", r"WD-"       # Work order
 ]
 
 # ==========================================================
 # SESSION
 # ==========================================================
-if "batch" not in st.session_state: st.session_state.batch=[]
-if "added_keys" not in st.session_state: st.session_state.added_keys=set()
-if "task_queue" not in st.session_state: st.session_state.task_queue=[]
-if "queue_ready" not in st.session_state: st.session_state.queue_ready=False
+if "batch" not in st.session_state: st.session_state.batch = []
+if "added_keys" not in st.session_state: st.session_state.added_keys = set()
+if "task_queue" not in st.session_state: st.session_state.task_queue = []
+if "queue_ready" not in st.session_state: st.session_state.queue_ready = False
 
 # ==========================================================
-# OCR (no Pillow)
+# OCR (NO PILLOW)
 # ==========================================================
 def ocr_raw(img_bytes):
     b64 = base64.b64encode(img_bytes).decode()
@@ -52,11 +56,11 @@ def ocr_raw(img_bytes):
         r = client.responses.create(
             model="gpt-4o-mini",
             input=[{
-                "role":"user",
-                "content":[
-                    {"type":"input_text","text":"Extract raw text only."},
-                    {"type":"input_image",
-                     "image_url":f"data:image/jpeg;base64,{b64}"}
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Extract raw text only."},
+                    {"type": "input_image",
+                     "image_url": f"data:image/jpeg;base64,{b64}"}
                 ]
             }]
         )
@@ -78,7 +82,7 @@ def repair_prefix(t):
         t = re.sub(pat, rep, t)
     return t
 
-def similarity(a,b):
+def similarity(a, b):
     return sum(1 for x,y in zip(a.upper(),b.upper()) if x==y)
 
 # ==========================================================
@@ -87,14 +91,13 @@ def similarity(a,b):
 def extract_type_components(raw):
     lines = [l.strip() for l in raw.split("\n") if l.strip()]
     ci = None
+
     for i,l in enumerate(lines):
         if "cut>" in l.lower():
             ci = i
             break
-    if ci is None:
-        return "","",""
 
-    if ci+1 >= len(lines):
+    if ci is None or ci+1 >= len(lines):
         return "","",""
 
     tline = repair_prefix(lines[ci+1])
@@ -110,7 +113,6 @@ def extract_type_components(raw):
     tint = ""
     glass_type = ""
 
-    # detect tint
     for p in parts:
         up = p.upper()
         best = up
@@ -123,7 +125,6 @@ def extract_type_components(raw):
         if best_score >= 2:
             tint = best
 
-    # type = middle
     if tint:
         mid = tline.replace(thickness,"",1).replace(tint,"",1).strip()
         glass_type = re.sub(r"\s+"," ",mid)
@@ -134,36 +135,31 @@ def extract_type_components(raw):
 # SIZE EXTRACTION
 # ==========================================================
 def is_valid_size_line(l):
-    if "x" not in l.lower():
-        return False
+    if "x" not in l.lower(): return False
     for pat in SIZE_REJECT_PATTERNS:
-        if re.search(pat,l):
-            return False
-    if ":" in l:
-        return False
+        if re.search(pat, l): return False
+    if ":" in l: return False
     return True
 
 def clean_size(s):
     s = re.sub(r"[^0-9xX/ ]"," ",s)
     s = re.sub(r"\s+"," ",s).strip()
     s = s.replace("X","x")
-    m = re.search(r"(\d{1,4}(?:\s*\d+/\d+)?)[ ]*x[ ]*(\d{1,4}(?:\s*\d+/\d+)?)", s)
+    m = re.search(r"(\d{1,4}(\s*\d+/\d+)?)[ ]*x[ ]*(\d{1,4}(\s*\d+/\d+)?)", s)
     if m:
-        return f"{m.group(1).strip()} x {m.group(2).strip()}"
+        return f"{m.group(1).strip()} x {m.group(3).strip()}"
     return ""
 
 def extract_size(raw):
     lines = [l.strip() for l in raw.split("\n") if l.strip()]
-    ci = None
+    ci=None
     for i,l in enumerate(lines):
         if "cut>" in l.lower():
             ci=i
             break
-    if ci is None:
-        return ""
+    if ci is None: return ""
 
-    # FIRST valid line after type
-    for j in range(ci+2, len(lines)):
+    for j in range(ci+2,len(lines)):
         l = lines[j]
         if is_valid_size_line(l):
             out = clean_size(l)
@@ -173,8 +169,7 @@ def extract_size(raw):
     # fallback
     text = " ".join(lines)
     m = re.search(r"\b(\d{1,4})\s+(\d{1,4})\b", text)
-    if m:
-        return f"{m.group(1)} x {m.group(2)}"
+    if m: return f"{m.group(1)} x {m.group(2)}"
     return ""
 
 # ==========================================================
@@ -189,12 +184,12 @@ def extract_po(raw):
     return m[0] if m else ""
 
 # ==========================================================
-# EMAIL
+# EMAIL SENDER
 # ==========================================================
 def send_email(csv_bytes, images):
     msg = EmailMessage()
     msg["From"] = f"{FROM_NAME} <{EMAIL_USER}>"
-    msg["To"] = TO_EMAILS
+    msg["To"]   = TO_EMAILS
     if CC_EMAILS:
         msg["Cc"] = CC_EMAILS
     msg["Subject"] = f"Glass Damage Report – {datetime.now():%Y-%m-%d %H:%M}"
@@ -202,16 +197,17 @@ def send_email(csv_bytes, images):
 
     msg.add_attachment(csv_bytes, maintype="text", subtype="csv",
                        filename="glass_report.csv")
+
     for i,img in enumerate(images):
         msg.add_attachment(img, maintype="image", subtype="jpeg",
                            filename=f"label_{i+1}.jpg")
 
     with smtplib.SMTP_SSL("smtp.gmail.com",465) as smtp:
-        smtp.login(EMAIL_USER,EMAIL_PASS)
+        smtp.login(EMAIL_USER, EMAIL_PASS)
         smtp.send_message(msg)
 
 # ==========================================================
-# QUEUE
+# PROCESS EMAIL QUEUE
 # ==========================================================
 def process_queue():
     if st.session_state.task_queue:
@@ -232,7 +228,7 @@ if mode == "Take Photo":
         key = hashlib.sha256(img).hexdigest()
         if key not in st.session_state.added_keys:
             st.session_state.batch.append(
-                {"img":img, "key":key, "qty":"", "reason":""}
+                {"img": img, "key": key, "qty": "", "reason": ""}
             )
             st.session_state.added_keys.add(key)
 
@@ -245,14 +241,14 @@ if mode == "Upload Photos":
             key = hashlib.sha256(img).hexdigest()
             if key not in st.session_state.added_keys:
                 st.session_state.batch.append(
-                    {"img":img, "key":key, "qty":"", "reason":""}
+                    {"img": img, "key": key, "qty": "", "reason": ""}
                 )
                 st.session_state.added_keys.add(key)
 
 st.subheader("Photos Added:")
 
 if not st.session_state.batch:
-    st.info("No photos yet.")
+    st.info("No photos added.")
 else:
     rm=[]
     for i,e in enumerate(st.session_state.batch):
@@ -285,8 +281,7 @@ if st.session_state.batch:
 
         writer.writerow([
             "index","Thickness","Type","Tint",
-            "Tempered","Size","Tag#","PO#",
-            "Qty","Reason"
+            "Tempered","Size","Tag#","PO#","Qty","Reason"
         ])
 
         for i,e in enumerate(st.session_state.batch,start=1):
@@ -318,8 +313,8 @@ if st.session_state.batch:
         csv_bytes = buf.getvalue().encode()
 
         st.session_state.task_queue.append({
-            "csv_bytes":csv_bytes,
-            "images":images
+            "csv_bytes": csv_bytes,
+            "images": images
         })
 
         st.session_state.queue_ready = True
