@@ -22,55 +22,34 @@ OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =====================================================================
-# VALID TYPES – MASTER DICTIONARY
+# VALID TYPE DICTIONARY (REVISED)
+# Used ONLY for suffix checking, NEVER for replacing the prefix
 # =====================================================================
-VALID_TYPES = [
-    "4.7A E180", "4.7A EI89",
-    "3.9ANREEDV", "3.9A NREEDV",
-    "3.1T Q366", "3.9T",
-    "3.9T Q272", "3.1T Q180",
-    "3.1T QI89", "3.0A E180ESC",
-    "3.9A E180ESC", "3.9T Q180",
-    "3.9T QI89", "3.9T Q366",
-    "3.1T", "5.7A",
-    "5.7A E366", "4.7A",
-    "4.7A E366", "3.1T MATT",
-    "3.1T QI89", "3.1T Q272",
-    "3.1T RAINV", "3.9T RAINV"
+
+VALID_SUFFIXES = [
+    "T", "E180ESC", "Q180", "E272", "Q272", "E366", "Q366",
+    "EI89", "QI89", "NREEDV", "MATT", "GRY", "P621", "BRZ"
 ]
 
-# Create prefix families
-A_PREFIXES = ("3.0A", "3.9A", "4.7A", "5.7A")
-T_PREFIXES = ("3.1T", "3.9T")
-NRE_PREFIX = ("3.9ANREEDV", "3.9A NREEDV")
-
+VALID_PREFIXES = ["3.1", "3.9", "4.7", "5.7"]
 
 # =====================================================================
-# IMAGE PREPROCESSING (cropping, contrast, sharpness)
+# IMAGE PREPROCESSING (OCR improvement)
 # =====================================================================
 def preprocess_image(img_bytes):
     img = Image.open(io.BytesIO(img_bytes))
-
-    # Convert to grayscale
     img = ImageOps.grayscale(img)
-
-    # Increase contrast
     img = ImageEnhance.Contrast(img).enhance(2.0)
-
-    # Slight sharpen
     img = ImageEnhance.Sharpness(img).enhance(1.5)
-
-    output = io.BytesIO()
-    img.save(output, format="JPEG", quality=90)
-    return output.getvalue()
-
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=92)
+    return buf.getvalue()
 
 # =====================================================================
-# OCR – STRICT GPT-4O-MINI RESPONSE FORMAT
+# OCR RAW TEXT (gpt-4o-mini)
 # =====================================================================
 def ocr_raw_text(img_bytes):
     b64 = base64.b64encode(img_bytes).decode("utf-8")
-
     try:
         response = client.responses.create(
             model="gpt-4o-mini",
@@ -78,7 +57,7 @@ def ocr_raw_text(img_bytes):
                 {
                     "role": "user",
                     "content": [
-                        {"type": "input_text", "text": "Extract ONLY raw text. Do NOT explain."},
+                        {"type": "input_text", "text": "Extract RAW TEXT ONLY. No explanation."},
                         {
                             "type": "input_image",
                             "image_url": f"data:image/jpeg;base64,{b64}"
@@ -91,73 +70,70 @@ def ocr_raw_text(img_bytes):
     except Exception as e:
         return f"OCR_ERROR: {str(e)}"
 
-
 # =====================================================================
-# TYPE MATCHING ENGINE
+# TYPE EXTRACTION – NO PARAPHRASING
+# Keep EXACT prefix (4.7 CL A E180 stays 4.7 CL A E180)
+# Only fix spacing + suffix spelling
 # =====================================================================
-def match_type(raw):
+def extract_type(raw):
 
-    # Normalize raw
-    text = raw.replace("\n", " ").upper()
-
-    # Try to detect prefix
-    prefix_match = None
-
-    for p in T_PREFIXES:
-        if p in text:
-            prefix_match = p
-            family = "T"
-            break
-
-    for p in A_PREFIXES:
-        if p in text:
-            prefix_match = p
-            family = "A"
-            break
-
-    for p in NRE_PREFIX:
-        if p in text:
-            prefix_match = p
-            family = "NRE"
-            break
-
-    if not prefix_match:
+    # Look for anything starting with a valid prefix (3.1, 3.9, 4.7, 5.7)
+    pattern = r"(3\.1|3\.9|4\.7|5\.7)[^\n]+"
+    m = re.search(pattern, raw)
+    if not m:
         return ""
 
-    # Filter dictionary by family
-    if family == "T":
-        candidates = [t for t in VALID_TYPES if t.startswith("3.1T") or t.startswith("3.9T")]
-    elif family == "A":
-        candidates = [t for t in VALID_TYPES if t.startswith(A_PREFIXES)]
-    else:
-        candidates = [t for t in VALID_TYPES if "NREEDV" in t]
+    line = m.group(0).strip().replace("  ", " ")
 
-    # Find best match inside family
-    best = ""
+    # Clean spacing between CL and A or similar patterns
+    line = re.sub(r"\bCL\s+A\b", "CL A", line)  # ensure consistent spacing
+
+    # Now we must verify suffix if present
+    parts = line.split()
+
+    # If only prefix present → CLEAR (return prefix only)
+    if len(parts) == 1:
+        return parts[0]
+
+    # If prefix + 1 or more extra segments → keep EXACT STRING
+    # But correct the final suffix spelling if it's close
+    prefix = parts[0]
+    suffix_parts = parts[1:]
+
+    # Build suffix candidate
+    suffix_raw = "".join(suffix_parts).upper().replace(" ", "")
+
+    # Check if suffix matches allowed list
+    best_suffix = None
     best_score = -1
 
-    for c in candidates:
-        score = similarity(text, c)
+    for valid in VALID_SUFFIXES:
+        score = similarity(suffix_raw, valid)
         if score > best_score:
             best_score = score
-            best = c
+            best_suffix = valid
 
-    # If best is EXACT prefix only, type = CLEAR form
-    if best in T_PREFIXES or best in A_PREFIXES:
-        return best  # CLEAR type rule
+    # If suffix loosely matches → correct it
+    # Otherwise leave suffix AS IS
+    if best_score > 0:
+        # Rebuild type without altering prefix
+        fixed = f"{prefix} " + " ".join(suffix_parts)
+        # Replace only the last segment (suffix)
+        fixed = re.sub(r"[A-Z0-9]+$", best_suffix, fixed)
+        return fixed.strip()
 
-    return best
-
-
-# Simple similarity metric
-def similarity(a, b):
-    a = a.strip().upper()
-    b = b.strip().upper()
-    return sum(1 for x, y in zip(a, b) if x == y)
-
+    return line.strip()
 
 # =====================================================================
-# SIZE EXTRACTION (fraction reconstruction)
+# Similarity metric
+# =====================================================================
+def similarity(a, b):
+    a, b = a.upper(), b.upper()
+    score = sum(1 for x, y in zip(a, b) if x == y)
+    return score
+
+# =====================================================================
+# SIZE EXTRACTION
 # =====================================================================
 def extract_size(raw):
     pat = r"(\d{2,4})\s*(\d+\/\d+).*?(\d{2,4})\s*(\d+\/\d+)"
@@ -167,64 +143,45 @@ def extract_size(raw):
     w, wf, h, hf = m.groups()
     return f"{w} {wf} x {h} {hf}"
 
-
 # =====================================================================
-# PO# EXTRACTION
-# =====================================================================
-def extract_po(raw):
-    m = re.search(r"\b\d{3,6}-\d{3}\b", raw)
-    return m.group(0) if m else ""
-
-
-# =====================================================================
-# TAG# EXTRACTION (NO RECONSTRUCTION)
+# TAG# (NO reconstruction)
 # =====================================================================
 def extract_tag(raw):
-    # Only extract the FIRST six-digit number and optional trailing symbols
     m = re.search(r"\b\d{6}(?:[-.,]\d+)?\b", raw)
     return m.group(0) if m else ""
 
+# =====================================================================
+# PO# (Allow multiple matches, pick first)
+# =====================================================================
+def extract_po(raw):
+    matches = re.findall(r"\b\d{3,6}-\d{3}\b", raw)
+    return matches[0] if matches else ""
 
 # =====================================================================
-# SEND EMAIL WITH TABLE + CSV
+# SEND EMAIL (Table + CSV + Image)
 # =====================================================================
-def send_email(table, csv_bytes, img_bytes):
+def send_email(table_line, csv_bytes, img_bytes):
     msg = EmailMessage()
     msg["From"] = f"{FROM_NAME} <{EMAIL_USER}>"
     msg["To"] = TO_EMAILS
     if CC_EMAILS:
         msg["Cc"] = CC_EMAILS
     msg["Subject"] = f"Glass Damage Report – {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    msg.set_content(table)
+    msg.set_content(table_line)
 
-    # CSV attachment
-    msg.add_attachment(
-        csv_bytes,
-        maintype="text",
-        subtype="csv",
-        filename="glass_report.csv"
-    )
-
-    # Image attachment
-    msg.add_attachment(
-        img_bytes,
-        maintype="image",
-        subtype="jpeg",
-        filename="label.jpg"
-    )
+    msg.add_attachment(csv_bytes, maintype="text", subtype="csv", filename="glass_report.csv")
+    msg.add_attachment(img_bytes, maintype="image", subtype="jpeg", filename="label.jpg")
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(EMAIL_USER, EMAIL_PASS)
         smtp.send_message(msg)
 
-
 # =====================================================================
-# UI – SINGLE PAGE
+# UI — SINGLE PAGE
 # =====================================================================
-st.title("KV Glass Damage Reporter – Final Version")
+st.title("KV Glass Damage Reporter")
 
-mode = st.radio("Choose input:", ["Take Photo", "Upload Photo"])
-
+mode = st.radio("Input Method:", ["Take Photo", "Upload Photo"])
 img_bytes = None
 
 if mode == "Take Photo":
@@ -233,66 +190,42 @@ if mode == "Take Photo":
         img_bytes = cam.getvalue()
 
 if mode == "Upload Photo":
-    f = st.file_uploader("Upload label image", type=["jpg", "jpeg", "png"])
+    f = st.file_uploader("Upload Image", type=["jpg", "jpeg", "png"])
     if f:
         img_bytes = f.read()
 
-# =====================================================================
-# PROCESS
-# =====================================================================
 if img_bytes:
-
     st.image(img_bytes, caption="Preview", use_column_width=True)
+
     reason = st.selectbox("Reason", ["Scratched", "Broken", "Missing", "KV Production Issue"])
     notes = st.text_area("Notes (Qty must be included here)")
 
     if st.button("Process & Send"):
-        with st.spinner("Extracting…"):
+        with st.spinner("Extracting details …"):
 
-            # preprocess
             prep = preprocess_image(img_bytes)
-
-            # OCR
             raw = ocr_raw_text(prep)
 
-            # Extract fields
             size = extract_size(raw)
-            gtype = match_type(raw)
+            gtype = extract_type(raw)
             tag = extract_tag(raw)
             po = extract_po(raw)
 
             qty_m = re.search(r"\b\d+\b", notes)
             qty = qty_m.group(0) if qty_m else ""
 
-            # Build table
-            table = (
-                "Glass Damage Report\n\n"
-                "+-------+--------------------------+\n"
-                "| Field | Value                    |\n"
-                "+-------+--------------------------+\n"
-                f"| Size  | {size} |\n"
-                f"| Type  | {gtype} |\n"
-                f"| Tag#  | {tag} |\n"
-                f"| PO#   | {po} |\n"
-                f"| Qty   | {qty} |\n"
-                "+-------+--------------------------+\n"
-            )
+            # Horizontal table (ONE ROW)
+            table_line = f"index,Size,Type,Tag#,PO#,Qty,Reason\n1,{size},{gtype},{tag},{po},{qty},{reason}"
 
-            st.code(table)
+            st.code(table_line)
 
-            # Create CSV
-            csv_buffer = io.StringIO()
-            writer = csv.writer(csv_buffer)
-            writer.writerow(["Field", "Value"])
-            writer.writerow(["Size", size])
-            writer.writerow(["Type", gtype])
-            writer.writerow(["Tag#", tag])
-            writer.writerow(["PO#", po])
-            writer.writerow(["Qty", qty])
+            # CSV bytes
+            csv_out = io.StringIO()
+            writer = csv.writer(csv_out)
+            writer.writerow(["index", "Size", "Type", "Tag#", "PO#", "Qty", "Reason"])
+            writer.writerow(["1", size, gtype, tag, po, qty, reason])
+            csv_bytes = csv_out.getvalue().encode("utf-8")
 
-            csv_bytes = csv_buffer.getvalue().encode("utf-8")
-
-            # Send Email
-            send_email(table, csv_bytes, img_bytes)
+            send_email(table_line, csv_bytes, img_bytes)
 
             st.success("Report sent successfully!")
