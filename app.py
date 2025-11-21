@@ -61,10 +61,6 @@ def send_email(subject, body, attachments):
 # OCR FUNCTION (OpenAI Vision)
 # =====================================================================
 def run_ocr(img_bytes):
-    """
-    Sends raw JPEG bytes to OpenAI Vision OCR.
-    Returns raw extracted text.
-    """
     try:
         b64 = base64.b64encode(img_bytes).decode("utf-8")
 
@@ -74,18 +70,24 @@ def run_ocr(img_bytes):
                 {
                     "role": "user",
                     "content": [
-                        {"type": "input_text", "text": "Extract ALL text. Do not interpret. Just raw OCR."},
-                        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"}
+                        {
+                            "type": "text",
+                            "text": "Extract ALL text from this image. Do not interpret, only raw OCR."
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": f"data:image/jpeg;base64,{b64}"
+                        }
                     ]
                 }
             ],
-            max_tokens=300
+            max_tokens=500
         )
 
         return response.choices[0].message.content.strip()
-
     except Exception as e:
         return f"OCR_ERROR: {e}"
+
 
 # =====================================================================
 # IMAGE PREVIEW HELPER
